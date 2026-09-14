@@ -111,6 +111,164 @@
 		regulator-boot-on;
 	};
 
+	/*
+	 * Front camera (IMX355) digital/IO rails. On the vendor these are
+	 * board rails that stay on; LWIS only toggles avdd (slg51000_ldo1).
+	 * Modelled as always-on fixed regulators so the mainline imx355 driver
+	 * (which requires avdd/dvdd/dovdd) can enable its bulk supplies.
+	 * TODO(M1b): map to the real s2mpg rails feeding the sensor.
+	 */
+	cam_dvdd: regulator-cam-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam-dvdd";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	cam_dovdd: regulator-cam-dovdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam-dovdd";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/*
+	 * Camera MIPI D/C-combo PHYs (samsung,mipi-phy-m0s4s4s4s4s4), one per
+	 * CSIS link. Driven by phy-exynos-mipi-gs101; isolation via the gs101
+	 * PMU syscon, reset via the CSIS sysreg. Consumed by the MIPI-CSIS
+	 * receiver nodes (added with the CSIS driver, M-next). Addresses/reset
+	 * bits from vendor gs101-isp.dtsi.
+	 */
+	sysreg_csis_reset: system-controller@1a420500 {
+		compatible = "samsung,exynos-csis", "syscon";
+		reg = <0x0 0x1A420500 0x8>;
+	};
+
+	mipi_phy_csis0: dcphy@1a4f1300 {
+		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		isolation = <0x3ebc>;
+		samsung,reset-sysreg = <&sysreg_csis_reset>;
+		reset = <0>;
+		reg = <0x0 0x1A4F1300 0x500>;
+		owner = <1>;
+		#phy-cells = <1>;
+	};
+
+	mipi_phy_csis1: dcphy@1a4f1b00 {
+		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		isolation = <0x3ebc>;
+		samsung,reset-sysreg = <&sysreg_csis_reset>;
+		reset = <1>;
+		reg = <0x0 0x1A4F1B00 0x500>;
+		owner = <1>;
+		#phy-cells = <1>;
+	};
+
+	mipi_phy_csis2: dcphy@1a4f2300 {
+		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		isolation = <0x3ebc>;
+		samsung,reset-sysreg = <&sysreg_csis_reset>;
+		reset = <2>;
+		reg = <0x0 0x1A4F2300 0x300>;
+		owner = <1>;
+		#phy-cells = <1>;
+	};
+
+	mipi_phy_csis3: dcphy@1a4f2600 {
+		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		isolation = <0x3ebc>;
+		samsung,reset-sysreg = <&sysreg_csis_reset>;
+		reset = <3>;
+		reg = <0x0 0x1A4F2600 0x300>;
+		owner = <1>;
+		#phy-cells = <1>;
+	};
+
+	mipi_phy_csis4: dcphy@1a4f2b00 {
+		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		isolation = <0x3ebc>;
+		samsung,reset-sysreg = <&sysreg_csis_reset>;
+		reset = <4>;
+		reg = <0x0 0x1A4F2B00 0x300>;
+		owner = <1>;
+		#phy-cells = <1>;
+	};
+
+	mipi_phy_csis5: dcphy@1a4f2e00 {
+		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		isolation = <0x3ebc>;
+		samsung,reset-sysreg = <&sysreg_csis_reset>;
+		reset = <5>;
+		reg = <0x0 0x1A4F2E00 0x300>;
+		owner = <1>;
+		#phy-cells = <1>;
+	};
+
+	mipi_phy_csis6: dcphy@1a4f3300 {
+		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		isolation = <0x3ebc>;
+		samsung,reset-sysreg = <&sysreg_csis_reset>;
+		reset = <6>;
+		reg = <0x0 0x1A4F3300 0x300>;
+		owner = <1>;
+		#phy-cells = <1>;
+	};
+
+	mipi_phy_csis7: dcphy@1a4f3600 {
+		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		isolation = <0x3ebc>;
+		samsung,reset-sysreg = <&sysreg_csis_reset>;
+		reset = <7>;
+		reg = <0x0 0x1A4F3600 0x300>;
+		owner = <1>;
+		#phy-cells = <1>;
+	};
+
+	/*
+	 * MIPI-CSIS receiver (google,gs101-mipi-csis). One block fronting the
+	 * 8 CSIS links + the CSIS write-DMA (raw Bayer -> DRAM). Register bases
+	 * from vendor gs101-isp.dtsi (lwis_csi). Consumes the 8 dcphys above.
+	 * Clocks left out until the gs101 CMU models UMUX_CLKCMU_CSIS_BUS +
+	 * GATE_DFTMUX_CMU_CIS_CLKn; sensor port wiring added with streaming.
+	 */
+	gs101_csis: mipi-csis@1a440000 {
+		compatible = "google,gs101-mipi-csis";
+		reg = <0x0 0x1A440000 0x1000>,   /* csis-link0 */
+		      <0x0 0x1A4D0000 0x10000>,  /* csis-dma (WDMA) */
+		      <0x0 0x1A4F0000 0x10000>;  /* csis-phy */
+		reg-names = "csis-link0", "csis-dma", "csis-phy";
+		phys = <&mipi_phy_csis0 0>, <&mipi_phy_csis1 0>,
+		       <&mipi_phy_csis2 0>, <&mipi_phy_csis3 0>,
+		       <&mipi_phy_csis4 0>, <&mipi_phy_csis5 0>,
+		       <&mipi_phy_csis6 0>, <&mipi_phy_csis7 0>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* sink from the front camera (IMX355) */
+			port@0 {
+				reg = <0>;
+				csis_sink: endpoint {
+					remote-endpoint = <&imx355_ep>;
+					data-lanes = <1 2 3 4>;
+				};
+			};
+		};
+	};
+
 	reserved-memory {
 		cont_splash_mem: splash@fac00000 {
 			/* size to be updated by actual board */
@@ -151,6 +309,13 @@
 			#clock-cells = <1>;
 			clock-output-names = "rtc32k_ap", "peri32k1",
 					     "peri32k2";
+		};
+
+		s2mpg10_gpio: s2mpg10-gpio {
+			compatible = "samsung,s2mpg10-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <6>;
 		};
 
 		regulators {
@@ -462,6 +627,43 @@
 		vinl5s-supply = <&s2mpg11_buckboost>;
 		vinl6s-supply = <&s2mpg11_buckboost>;
 		vinbd-supply = <&s2mpg11_buckboost>;
+
+		s2mpg11_gpio: s2mpg11-gpio {
+			compatible = "samsung,s2mpg11-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <6>;
+
+			/*
+			 * pu/buck/bb are the SLG51000 camera-PMIC master
+			 * enables. They are NOT hogged here any more: the
+			 * slg51000 driver now owns them (dlg,pu/buck/bb-gpios)
+			 * and drives them in the required order at probe
+			 * (bb -> buck -> cs -> pu). Hogging them output-high at
+			 * DT-parse asserted pu before cs, which left the buck/
+			 * buck-boost-fed LDOs (ldo5/6/7 = cam dvdd/dovdd)
+			 * un-armed, so the sensors NACK'd on I2C (-EIO).
+			 *
+			 * slg51000_pu_hog {
+			 *	gpio-hog;
+			 *	gpios = <4 GPIO_ACTIVE_HIGH>;
+			 *	output-high;
+			 *	line-name = "slg51000_pu";
+			 * };
+			 * slg51000_buck_hog {
+			 *	gpio-hog;
+			 *	gpios = <3 GPIO_ACTIVE_HIGH>;
+			 *	output-high;
+			 *	line-name = "slg51000_buck";
+			 * };
+			 * slg51000_bb_hog {
+			 *	gpio-hog;
+			 *	gpios = <1 GPIO_ACTIVE_HIGH>;
+			 *	output-high;
+			 *	line-name = "slg51000_bb";
+			 * };
+			 */
+		};
 
 		regulators {
 			buck1s {
@@ -1021,6 +1223,103 @@
 		interrupts = <0 IRQ_TYPE_LEVEL_HIGH>;
 		reset-gpios = <&gpp24 2 GPIO_ACTIVE_HIGH>;
 	};
+
+	/*
+	 * SLG51000 camera-side PMIC. The driver powers the chip up by
+	 * driving the four master-enable lines in order at probe
+	 * (bb -> buck -> cs -> pu), matching the vendor camera-pmic DT.
+	 * Also supplies the VL53L1 ToF sensor's VIO from ldo1.
+	 */
+	slg51000: pmic@75 {
+		compatible = "dlg,slg51000";
+		reg = <0x75>;
+		dlg,bb-gpios = <&s2mpg11_gpio 1 GPIO_ACTIVE_HIGH>;
+		dlg,buck-gpios = <&s2mpg11_gpio 3 GPIO_ACTIVE_HIGH>;
+		dlg,cs-gpios = <&s2mpg11_gpio 0 GPIO_ACTIVE_HIGH>;
+		dlg,pu-gpios = <&s2mpg11_gpio 4 GPIO_ACTIVE_HIGH>;
+
+		regulators {
+			/*
+			 * SLG51000 LDO bias pairing (found empirically on the
+			 * device): an LDO only reaches VOUT_OK if its bias
+			 * companion is also enabled -
+			 *   ldo7 <- ldo1,  ldo6 <- ldo5,  ldo2/ldo5 <- ldo4.
+			 * ldo3 stands alone. So ldo1, ldo4 and ldo5 are marked
+			 * always-on: they are the companions that let the sensor
+			 * rails (ldo3/6/7 for imx355, ldo2/5/7 for imx386) come
+			 * up. Without them the sensor gets avdd but no dvdd/
+			 * dovdd -> I2C tx timeout / -EIO. A companion only needs
+			 * to be *enabled* to provide bias; it need not itself
+			 * regulate.
+			 *
+			 * ldo1 = front-cam EEPROM (m24c64s @0x51) + bias for ldo7.
+			 */
+			slg51000_ldo1: ldo1 {
+				regulator-name = "slg51000_ldo1";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
+			/*
+			 * IMX355 front camera rails:
+			 *   ldo3 = avdd  2.8 V   (reg-init 0x2300 = 0xA0)
+			 *   ldo6 = dvdd  1.2 V   (reg-init 0x2900 = 0xA0)
+			 *   ldo7 = dovdd 1.8 V   (reg 0x3100, HW default)
+			 */
+			slg51000_ldo3: ldo3 {
+				regulator-name = "slg51000_ldo3";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+
+			slg51000_ldo6: ldo6 {
+				regulator-name = "slg51000_ldo6";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <1200000>;
+			};
+
+			slg51000_ldo7: ldo7 {
+				regulator-name = "slg51000_ldo7";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			/*
+			 * IMX386 rear ultra-wide rails (proto1 wiring):
+			 *   ldo2 = avdd 2.8 V, ldo5 = dvdd 1.2 V, ldo7 = dovdd (shared)
+			 */
+			slg51000_ldo2: ldo2 {
+				regulator-name = "slg51000_ldo2";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+
+			slg51000_ldo5: ldo5 {
+				regulator-name = "slg51000_ldo5";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <1200000>;
+				/* dvdd for imx386; also bias companion for ldo6 */
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
+			/*
+			 * ldo4 is not wired to a sensor rail, but it is the bias
+			 * companion that lets ldo2 (imx386 avdd) and ldo5 reach
+			 * VOUT_OK. Kept always-on for that; voltage left at its
+			 * hardware default (wide range, no clamp).
+			 */
+			slg51000_ldo4: ldo4 {
+				regulator-name = "slg51000_ldo4";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <3750000>;
+				regulator-always-on;
+				regulator-boot-on;
+			};
+		};
+	};
 };
 
 &watchdog_cl0 {
@@ -1402,6 +1701,11 @@
 		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
 		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
 	};
+
+	/*
+	 * Front camera (IMX355) master clock uses the existing sensor_mclk2_fn
+	 * pinmux (gpp5-0 func 2) already defined in gs101-pinctrl.dtsi.
+	 */
 };
 
 /*
@@ -1414,3 +1718,102 @@
  * already-enumerated endpoint up cleanly -- the state that works on cold
  * boot. (This is why adding a node for kexec survival regressed cold boot.)
  */
+
+/*
+ * Front camera: Sony IMX355 on HSI2C bus 2 (@0x1a). M1 = probe + chip-ID over
+ * I2C (proves slg51000 rails + clock + reset). Master clock is CIS_CLK1 out of
+ * CMU_TOP at 24.576 MHz (gs101 has no 19.2 MHz; imx355 driver patched to accept
+ * it). reset is active-low in hardware (pin high = run); the mainline driver
+ * asserts logical-1 for reset, so declare GPIO_ACTIVE_LOW.
+ * CSIS endpoint is wired up in M2.
+ */
+/* Enable the USI2 wrapper in I2C mode so hsi2c_2 (front camera bus) comes up. */
+&usi2 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_2 {
+	status = "okay";
+
+	imx355: camera-sensor@1a {
+		compatible = "sony,imx355";
+		reg = <0x1a>;
+
+		/*
+		 * Sensor mclk = the final CIS_CLK1 output, which is the divider
+		 * (DOUT), not the gate (GOUT) that sits before it. Consuming DOUT
+		 * makes imx355 read the true rate and enabling it propagates up
+		 * through the gate. mux default parent is oscclk (24.576 MHz), so
+		 * the divider resolves to /1. If the CMU cannot honour this, imx355
+		 * probe prints the actual rate ("external clock N is not supported").
+		 */
+		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
+		assigned-clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
+		assigned-clock-rates = <24576000>;
+
+		reset-gpios = <&gpp4 2 GPIO_ACTIVE_LOW>;
+
+		avdd-supply = <&slg51000_ldo3>;		/* 2.8 V */
+		dvdd-supply = <&slg51000_ldo6>;		/* 1.2 V */
+		dovdd-supply = <&slg51000_ldo7>;	/* 1.8 V */
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&sensor_mclk2_fn>;
+
+		port {
+			imx355_ep: endpoint {
+				remote-endpoint = <&csis_sink>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <360000000>;
+			};
+		};
+	};
+
+	/*
+	 * Front camera module EEPROM (m24c64s), same board as the IMX355 and
+	 * powered by the same avdd rail (slg51000_ldo1) but needing no mclk or
+	 * reset. Used as a canary: if at24 reads this, avdd + the bus + the slg
+	 * LDO1 output are all good, and the IMX355 -EIO is sensor-specific
+	 * (dvdd/mclk). If this also fails, the slg power-up (avdd) is the fault.
+	 */
+	cam_front_eeprom: eeprom@51 {
+		compatible = "atmel,24c64";
+		reg = <0x51>;
+		vcc-supply = <&slg51000_ldo1>;
+	};
+};
+
+/*
+ * Rear ultra-wide camera: Sony IMX386 on HSI2C bus 3 (@0x1a). 2-lane MIPI,
+ * CIS_CLK0 on sensor_mclk1 (gpp3-0). Proto1 rails: avdd=ldo2, dvdd=ldo5,
+ * dovdd=ldo7 (shared with IMX355). reset gpp6-3 (active-low in the driver).
+ */
+&hsi2c_3 {
+	status = "okay";
+
+	imx386: camera-sensor@1a {
+		compatible = "sony,imx386";
+		reg = <0x1a>;
+
+		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
+		assigned-clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
+		assigned-clock-rates = <24576000>;
+
+		reset-gpios = <&gpp6 3 GPIO_ACTIVE_LOW>;
+
+		avdd-supply = <&slg51000_ldo2>;
+		dvdd-supply = <&slg51000_ldo5>;
+		dovdd-supply = <&slg51000_ldo7>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&sensor_mclk1_fn>;
+
+		port {
+			imx386_ep: endpoint {
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <360000000>;
+			};
+		};
+	};
+};

@@ -21,6 +21,19 @@ config PHY_EXYNOS_MIPI_VIDEO
 	  Support for MIPI CSI-2 and MIPI DSI DPHY found on Samsung S5P
 	  and Exynos SoCs.
 
+config PHY_EXYNOS_MIPI_CSIS_GS101
+	tristate "Google gs101 (Tensor) MIPI CSI/DSI D/C-PHY driver"
+	depends on HAS_IOMEM
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on OF
+	select GENERIC_PHY
+	select MFD_SYSCON
+	help
+	  Support for the MIPI CSI-2 / DSI D/C-combo PHY
+	  (samsung,mipi-phy-m0s4s4s4s4s4) found on the Google gs101 (Tensor)
+	  SoC, used by the camera MIPI-CSIS receivers. PHY isolation is driven
+	  through the gs101 PMU syscon.
+
 config PHY_GS101_PCIE
 	tristate "Google gs101 PCIe PHY driver"
 	depends on ARCH_EXYNOS || COMPILE_TEST

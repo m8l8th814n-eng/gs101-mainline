@@ -266,6 +266,15 @@ config VIDEO_IMX355
 	  To compile this driver as a module, choose M here: the
 	  module will be called imx355.
 
+config VIDEO_IMX386
+	tristate "Sony IMX386 sensor support"
+	help
+	  This is a Video4Linux2 sensor driver for the Sony
+	  IMX386 camera.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called imx386.
+
 config VIDEO_IMX412
 	tristate "Sony IMX412 sensor support"
 	depends on OF

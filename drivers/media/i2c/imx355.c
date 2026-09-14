@@ -64,6 +64,14 @@
 /* default link frequency and external clock */
 #define IMX355_LINK_FREQ_DEFAULT	360000000LL
 #define IMX355_EXT_CLK			19200000
+/*
+ * gs101/oriole clocks the sensor from CIS_CLK (osc 24.576 MHz); the CMU cannot
+ * synthesise 19.2 MHz, so accept the platform's external clock too. Note the
+ * mode/PLL register tables below are still computed for 19.2 MHz -- this is
+ * sufficient to probe and read the chip ID, but a valid stream needs 24.576 MHz
+ * mode tables.
+ */
+#define IMX355_EXT_CLK_GS101		24576000
 #define IMX355_LINK_FREQ_INDEX		0
 
 /* number of data lanes */
@@ -1537,10 +1545,19 @@ static int imx355_power_off(struct device *dev)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx355 *imx355 = to_imx355(sd);
 
+	/*
+	 * Mirror imx355_power_on() / the vendor power-down order: assert reset,
+	 * then stop the master clock, then drop the regulators, with the same
+	 * settling delays between steps.
+	 */
 	gpiod_set_value_cansleep(imx355->reset_gpio, 1);
+	usleep_range(1000, 2000);
+
+	clk_disable_unprepare(imx355->clk);
+	usleep_range(1000, 2000);
 
 	regulator_bulk_disable(ARRAY_SIZE(imx355_supplies), imx355->supplies);
-	clk_disable_unprepare(imx355->clk);
+	usleep_range(1000, 2000);
 
 	return 0;
 }
@@ -1552,15 +1569,23 @@ static int imx355_power_on(struct device *dev)
 	struct imx355 *imx355 = to_imx355(sd);
 	int ret;
 
-	ret = clk_prepare_enable(imx355->clk);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to enable clocks");
-
+	/*
+	 * Follow the vendor (LWIS) power-up order used on the Pixel 6 module:
+	 * regulators first, then the master clock, then release reset, with
+	 * settling delays in between. The mainline default enabled the clock
+	 * before the regulators, which leaves this sensor unresponsive on I2C.
+	 */
 	ret = regulator_bulk_enable(ARRAY_SIZE(imx355_supplies),
 				    imx355->supplies);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to enable regulators");
+
+	usleep_range(1000, 2000);
+
+	ret = clk_prepare_enable(imx355->clk);
 	if (ret) {
-		dev_err_probe(dev, ret, "failed to enable regulators");
-		goto error_disable_clocks;
+		dev_err_probe(dev, ret, "failed to enable clock");
+		goto error_disable_regulators;
 	}
 
 	usleep_range(1000, 2000);
@@ -1569,8 +1594,8 @@ static int imx355_power_on(struct device *dev)
 
 	return 0;
 
-error_disable_clocks:
-	clk_disable_unprepare(imx355->clk);
+error_disable_regulators:
+	regulator_bulk_disable(ARRAY_SIZE(imx355_supplies), imx355->supplies);
 	return ret;
 }
 
@@ -1749,7 +1774,7 @@ static int imx355_probe(struct i2c_client *client)
 				     "failed to get clock\n");
 
 	freq = clk_get_rate(imx355->clk);
-	if (freq != IMX355_EXT_CLK)
+	if (freq != IMX355_EXT_CLK && freq != IMX355_EXT_CLK_GS101)
 		return dev_err_probe(imx355->dev, -EINVAL,
 				     "external clock %lu is not supported\n",
 				     freq);

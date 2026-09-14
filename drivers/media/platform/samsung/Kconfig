@@ -2,6 +2,21 @@
 
 comment "Samsung media platform drivers"
 
+config VIDEO_GS101_MIPI_CSIS
+	tristate "Google gs101 (Tensor) MIPI-CSIS receiver"
+	depends on OF
+	depends on VIDEO_DEV
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	select GENERIC_PHY
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	select V4L2_FWNODE
+	help
+	  This is a V4L2 driver for the MIPI-CSIS (CSI-2 receiver) block on
+	  the Google gs101 (Tensor) SoC, providing raw Bayer capture from the
+	  camera sensors through the CSIS write-DMA. Say M to build it as the
+	  module gs101-mipi-csis.
+
 source "drivers/media/platform/samsung/exynos-gsc/Kconfig"
 source "drivers/media/platform/samsung/exynos4-is/Kconfig"
 source "drivers/media/platform/samsung/s3c-camif/Kconfig"

@@ -41,6 +41,15 @@ struct slg51000 {
 	struct regulator_desc *rdesc[SLG51000_MAX_REGULATORS];
 	struct regulator_dev *rdev[SLG51000_MAX_REGULATORS];
 	struct gpio_desc *cs_gpiod;
+	/*
+	 * Camera-PMIC master enables driven in a strict order at probe
+	 * (see slg51000_i2c_probe). bb/buck power the internal boost/buck
+	 * that feed the LV LDOs (ldo5/6/7); pu triggers the power-up
+	 * sequencer and must be asserted LAST, after cs is Ready.
+	 */
+	struct gpio_desc *bb_gpiod;
+	struct gpio_desc *buck_gpiod;
+	struct gpio_desc *pu_gpiod;
 	int chip_irq;
 };
 
@@ -439,25 +448,75 @@ static int slg51000_i2c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct slg51000 *chip;
-	struct gpio_desc *cs_gpiod;
+	struct gpio_desc *cs_gpiod, *bb_gpiod, *buck_gpiod, *pu_gpiod;
 	int error, ret;
 
 	chip = devm_kzalloc(dev, sizeof(struct slg51000), GFP_KERNEL);
 	if (!chip)
 		return -ENOMEM;
 
+	/*
+	 * SLG51000 camera-PMIC power-up sequence, matching the vendor
+	 * slg51000_power_on(): bb -> 2ms -> buck -> 2ms -> cs -> 10ms
+	 * (datasheet CS-HIGH-to-Ready) -> pu -> 1ms. The internal boost
+	 * (bb) and buck must be up before cs, and pu (which triggers the
+	 * power-up sequencer) must come LAST. Asserting these lines all at
+	 * once via DT gpio-hogs (before cs, at DT-parse) leaves the buck/
+	 * buck-boost-fed LDOs (ldo5/6/7 = camera dvdd/dovdd) un-armed, so
+	 * they never reach VOUT_OK and the sensors NACK on I2C (-EIO).
+	 * All lines are requested LOW and driven high here in order.
+	 */
+	bb_gpiod = devm_gpiod_get_optional(dev, "dlg,bb",
+					   GPIOD_OUT_LOW |
+						GPIOD_FLAGS_BIT_NONEXCLUSIVE);
+	if (IS_ERR(bb_gpiod))
+		return PTR_ERR(bb_gpiod);
+
+	buck_gpiod = devm_gpiod_get_optional(dev, "dlg,buck",
+					     GPIOD_OUT_LOW |
+						GPIOD_FLAGS_BIT_NONEXCLUSIVE);
+	if (IS_ERR(buck_gpiod))
+		return PTR_ERR(buck_gpiod);
+
 	cs_gpiod = devm_gpiod_get_optional(dev, "dlg,cs",
-					   GPIOD_OUT_HIGH |
+					   GPIOD_OUT_LOW |
 						GPIOD_FLAGS_BIT_NONEXCLUSIVE);
 	if (IS_ERR(cs_gpiod))
 		return PTR_ERR(cs_gpiod);
 
+	pu_gpiod = devm_gpiod_get_optional(dev, "dlg,pu",
+					   GPIOD_OUT_LOW |
+						GPIOD_FLAGS_BIT_NONEXCLUSIVE);
+	if (IS_ERR(pu_gpiod))
+		return PTR_ERR(pu_gpiod);
+
+	if (bb_gpiod) {
+		chip->bb_gpiod = bb_gpiod;
+		gpiod_set_value_cansleep(bb_gpiod, 1);
+		usleep_range(2000, 2020);
+	}
+
+	if (buck_gpiod) {
+		chip->buck_gpiod = buck_gpiod;
+		gpiod_set_value_cansleep(buck_gpiod, 1);
+		usleep_range(2000, 2020);
+	}
+
 	if (cs_gpiod) {
 		dev_info(dev, "Found chip selector property\n");
 		chip->cs_gpiod = cs_gpiod;
+		gpiod_set_value_cansleep(cs_gpiod, 1);
+		/* CS HIGH -> Ready is ~10ms per datasheet. */
+		usleep_range(10000, 11000);
+	} else {
+		usleep_range(10000, 11000);
 	}
 
-	usleep_range(10000, 11000);
+	if (pu_gpiod) {
+		chip->pu_gpiod = pu_gpiod;
+		gpiod_set_value_cansleep(pu_gpiod, 1);
+		usleep_range(1000, 1020);
+	}
 
 	i2c_set_clientdata(client, chip);
 	chip->chip_irq = client->irq;
@@ -502,9 +561,22 @@ static const struct i2c_device_id slg51000_i2c_id[] = {
 };
 MODULE_DEVICE_TABLE(i2c, slg51000_i2c_id);
 
+/*
+ * DT-instantiated i2c devices are auto-loaded via their OF modalias
+ * (of:...C<compatible>), so an of_match_table is required for the module
+ * to load automatically. Without it the driver only matches the i2c
+ * id_table and has to be modprobed by hand.
+ */
+static const struct of_device_id slg51000_dt_match[] = {
+	{ .compatible = "dlg,slg51000" },
+	{}
+};
+MODULE_DEVICE_TABLE(of, slg51000_dt_match);
+
 static struct i2c_driver slg51000_regulator_driver = {
 	.driver = {
 		.name = "slg51000-regulator",
+		.of_match_table = slg51000_dt_match,
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 	.probe = slg51000_i2c_probe,
