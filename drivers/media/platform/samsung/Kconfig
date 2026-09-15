@@ -11,6 +11,7 @@ config VIDEO_GS101_MIPI_CSIS
 	select MEDIA_CONTROLLER
 	select VIDEO_V4L2_SUBDEV_API
 	select V4L2_FWNODE
+	select VIDEOBUF2_DMA_CONTIG
 	help
 	  This is a V4L2 driver for the MIPI-CSIS (CSI-2 receiver) block on
 	  the Google gs101 (Tensor) SoC, providing raw Bayer capture from the

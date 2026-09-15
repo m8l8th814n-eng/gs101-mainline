@@ -8,6 +8,7 @@
 
 #include <linux/err.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
@@ -935,12 +936,34 @@ static int exynos_mipi_phy_init(struct phy *phy)
 	return __set_phy_init(state, phy_desc, 1);
 }
 
+/*
+ * Release/assert the D-PHY from reset via the CSIS SYSREG (samsung,exynos-csis
+ * @0x1A420500). The driver stored reg_reset + rst_bit but never wrote it; the
+ * PHY stays in reset after isolation-release, so any access to its SFRs (bias,
+ * lane regs) HANGS. The register is one 32-bit word (bit N = PHY N); the bit is
+ * an active-low reset_n, so setting it releases the PHY (mirrors the reset
+ * deassert the upstream rockchip-samsung-dcphy driver does before register I/O).
+ */
+static void __set_phy_reset(struct exynos_mipi_phy *state,
+			    struct mipi_phy_desc *phy_desc, unsigned int release)
+{
+	if (!state->reg_reset)
+		return;
+	regmap_update_bits(state->reg_reset, 0, BIT(phy_desc->rst_bit),
+			   release ? BIT(phy_desc->rst_bit) : 0);
+}
+
 static int exynos_mipi_phy_power_on(struct phy *phy)
 {
 	struct mipi_phy_desc *phy_desc = phy_get_drvdata(phy);
 	struct exynos_mipi_phy *state = to_mipi_video_phy(phy_desc);
+	int ret;
 
-	return __set_phy_state(state, phy_desc, 1);
+	ret = __set_phy_state(state, phy_desc, 1);
+	if (ret)
+		return ret;
+	__set_phy_reset(state, phy_desc, 1);	/* release from reset */
+	return 0;
 }
 
 static int exynos_mipi_phy_power_off(struct phy *phy)
@@ -948,6 +971,7 @@ static int exynos_mipi_phy_power_off(struct phy *phy)
 	struct mipi_phy_desc *phy_desc = phy_get_drvdata(phy);
 	struct exynos_mipi_phy *state = to_mipi_video_phy(phy_desc);
 
+	__set_phy_reset(state, phy_desc, 0);	/* hold in reset */
 	return __set_phy_state(state, phy_desc, 0);
 }
 
@@ -962,10 +986,53 @@ static struct phy *exynos_mipi_phy_of_xlate(struct device *dev,
 	return state->phys[args->args[0]].phy;
 }
 
+/*
+ * Program the D-PHY analog/timing registers for reception. Without this the PHY
+ * is only isolation-released (idle, STOPSTATE) and never locks onto the sensor's
+ * HS clock. The m0s4s4s4s4s4 combo PHY is a DCphy (major 0x0504); the minor
+ * selects the lane configuration (4-lane = 0x0000, 2-lane = 0x0001).
+ */
+static int exynos_mipi_phy_configure(struct phy *phy,
+				     union phy_configure_opts *opts)
+{
+	struct mipi_phy_desc *phy_desc = phy_get_drvdata(phy);
+	struct phy_configure_opts_mipi_dphy *dphy = &opts->mipi_dphy;
+	unsigned int lanes = dphy->lanes ? dphy->lanes : 4;
+	u32 speed_mbps = div_u64(dphy->hs_clk_rate, 1000000);
+	const struct exynos_mipi_phy_cfg *cfg;
+	u32 info[4];
+	u16 minor;
+
+	/* DCphy minor: 0x0000 = 4-lane, 0x0001 = 2-lane. */
+	minor = (lanes >= 4) ? 0x0000 : 0x0001;
+
+	for (cfg = phy_cfg_table; cfg->set; cfg++)
+		if (cfg->major == 0x0504 && cfg->minor == minor &&
+		    cfg->mode == 0x000D)
+			break;
+	if (!cfg->set) {
+		dev_err(&phy->dev, "no D-PHY cfg for %u lanes\n", lanes);
+		return -EINVAL;
+	}
+
+	info[TYPE] = 0x000D << 16;		/* D-PHY mode */
+	info[LANES] = lanes - 1;
+	info[SPEED] = speed_mbps;
+	/*
+	 * T_HS_SETTLE counter. Spec allows 85ns+6*UI .. 145ns+10*UI; this
+	 * mid-band value works for ~700 Mbps-1.5 Gbps and can be tuned on HW
+	 * if SOT/sync errors appear.
+	 */
+	info[SETTLE] = 0x10;
+
+	return cfg->set(phy_desc->regs, 0, info);
+}
+
 static struct phy_ops exynos_mipi_phy_ops = {
 	.init		= exynos_mipi_phy_init,
 	.power_on	= exynos_mipi_phy_power_on,
 	.power_off	= exynos_mipi_phy_power_off,
+	.configure	= exynos_mipi_phy_configure,
 	.owner		= THIS_MODULE,
 };
 

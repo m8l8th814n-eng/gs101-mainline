@@ -269,6 +269,7 @@
 			opp-hz = /bits/ 64 <1803000000>;
 			opp-microvolt = <906250>;
 			clock-latency-ns = <500000>;
+			turbo-mode;
 		};
 	};
 
@@ -358,6 +359,7 @@
 			opp-hz = /bits/ 64 <2253000000>;
 			opp-microvolt = <968750>;
 			clock-latency-ns = <500000>;
+			turbo-mode;
 		};
 	};
 
@@ -465,6 +467,7 @@
 			opp-hz = /bits/ 64 <2802000000>;
 			opp-microvolt = <1056250>;
 			clock-latency-ns = <500000>;
+			turbo-mode;
 		};
 	};
 
@@ -847,7 +850,7 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_1>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1004>;
-			status = "disabled";
+			status = "okay";
 
 			hsi2c_2: i2c@10910000 {
 				compatible = "google,gs101-hsi2c",
@@ -861,7 +864,7 @@
 				interrupts = <GIC_SPI 636 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c2_bus>;
 				pinctrl-names = "default";
-				status = "disabled";
+				status = "okay";
 			};
 
 			serial_2: serial@10910000 {
@@ -902,7 +905,8 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_2>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1008>;
-			status = "disabled";
+			status = "okay";
+			samsung,mode = <USI_MODE_I2C>;   /* USI_MODE_I2C = 3 kuken */
 
 			hsi2c_3: i2c@10920000 {
 				compatible = "google,gs101-hsi2c",
@@ -916,7 +920,7 @@
 				interrupts = <GIC_SPI 637 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c3_bus>;
 				pinctrl-names = "default";
-				status = "disabled";
+				status = "okay";
 			};
 
 			serial_3: serial@10920000 {

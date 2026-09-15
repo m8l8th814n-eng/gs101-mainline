@@ -152,7 +152,14 @@ static const struct regulator_bulk_data imx386_supplies[] = {
 };
 
 static const struct imx386_reg imx386_global_regs[] = {
-	{ 0x0103, 0x01 },
+	/*
+	 * Software reset (0x0103 = 0x01) is issued explicitly in
+	 * imx386_start_streaming() with a recovery delay; keeping it here would
+	 * reset the sensor again in the middle of the settings burst. The
+	 * sensor NAKs I2C for a short while after reset, so the register that
+	 * follows must not be written immediately (else -EIO).
+	 */
+	/* { 0x0103, 0x01 }, */
 	{ 0x0136, 0x18 },
 	{ 0x0137, 0x00 },
 	{ 0x3a7d, 0x00 },
@@ -707,6 +714,18 @@ static int imx386_start_streaming(struct imx386 *imx386)
 {
 	const struct imx386_reg_list *reg_list;
 	int ret;
+
+	/*
+	 * Software reset first, then wait for the sensor to recover. Sony IMX
+	 * sensors NAK I2C for a short window after a 0x0103 reset, so writing
+	 * the first setting immediately returns -EIO.
+	 */
+	ret = imx386_write_reg(imx386, 0x0103, 1, 0x01);
+	if (ret) {
+		dev_err(imx386->dev, "failed to soft reset sensor");
+		return ret;
+	}
+	usleep_range(12000, 13000);
 
 	/* Global Setting */
 	reg_list = &imx386_global_setting;

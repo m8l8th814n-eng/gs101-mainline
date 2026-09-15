@@ -237,22 +237,34 @@
 	};
 
 	/*
-	 * MIPI-CSIS receiver (google,gs101-mipi-csis). One block fronting the
-	 * 8 CSIS links + the CSIS write-DMA (raw Bayer -> DRAM). Register bases
-	 * from vendor gs101-isp.dtsi (lwis_csi). Consumes the 8 dcphys above.
-	 * Clocks left out until the gs101 CMU models UMUX_CLKCMU_CSIS_BUS +
-	 * GATE_DFTMUX_CMU_CIS_CLKn; sensor port wiring added with streaming.
+	 * MIPI-CSIS receivers (google,gs101-mipi-csis). Each gs101 CSIS link is
+	 * separate hardware (link N = 0x1A440000 + N * 0x10000), so each is its
+	 * own node/driver instance. They share the one CSIS write-DMA bank
+	 * (0x1A4D0000, raw Bayer -> DRAM) but write through distinct virtual
+	 * channels (google,csis-dma-vc). Register bases from vendor
+	 * gs101-isp.dtsi (lwis_csi); the dcphys above are reached through the
+	 * generic PHY framework, so the csis-phy bank is not mapped here.
+	 *
+	 * csis0: front camera IMX355 (4-lane) on link0 / dcphy0 / WDMA vc0.
 	 */
-	gs101_csis: mipi-csis@1a440000 {
+	gs101_csis0: mipi-csis@1a440000 {
 		compatible = "google,gs101-mipi-csis";
 		reg = <0x0 0x1A440000 0x1000>,   /* csis-link0 */
-		      <0x0 0x1A4D0000 0x10000>,  /* csis-dma (WDMA) */
-		      <0x0 0x1A4F0000 0x10000>;  /* csis-phy */
-		reg-names = "csis-link0", "csis-dma", "csis-phy";
-		phys = <&mipi_phy_csis0 0>, <&mipi_phy_csis1 0>,
-		       <&mipi_phy_csis2 0>, <&mipi_phy_csis3 0>,
-		       <&mipi_phy_csis4 0>, <&mipi_phy_csis5 0>,
-		       <&mipi_phy_csis6 0>, <&mipi_phy_csis7 0>;
+		      <0x0 0x1A4D0000 0x10000>;  /* csis-dma (WDMA, shared) */
+		reg-names = "csis-link0", "csis-dma";
+		/*
+		 * reg[0] = link bank; IRQs are the WDMA frame-done for this vc
+		 * (IRQ_CSIS_DMA0_CSIS = SPI 302) + the link IRQ (IRQ_CSIS0_CSIS
+		 * = SPI 294), per vendor dt-bindings/.../gs101.h.
+		 */
+		interrupts = <GIC_SPI 302 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 294 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupt-names = "csis-dma0", "csis-link0";
+		clocks = <&cmu_top CLK_GOUT_CMU_CSIS_BUS>;
+		clock-names = "csis";
+		phys = <&mipi_phy_csis0 0>;
+		memory-region = <&camera_cma>;
+		google,csis-dma-vc = <0>;
 
 		ports {
 			#address-cells = <1>;
@@ -269,12 +281,72 @@
 		};
 	};
 
+	/*
+	 * csis2: rear ultra-wide IMX386 (2-lane) on link2 / dcphy2 / WDMA vc1.
+	 * link2 is a 2-lane-capable PHY (dcphy2), matching the sensor. The
+	 * exact link/PHY index is the vendor's physical routing; adjust here if
+	 * the sensor never reaches FRAME_START on this link.
+	 */
+	gs101_csis2: mipi-csis@1a460000 {
+		compatible = "google,gs101-mipi-csis";
+		reg = <0x0 0x1A460000 0x1000>,   /* csis-link2 */
+		      <0x0 0x1A4D0000 0x10000>;  /* csis-dma (WDMA, shared) */
+		reg-names = "csis-link2", "csis-dma";
+		/* WDMA vc1 frame-done (IRQ_CSIS_DMA1_CSIS = SPI 303) + link2
+		 * IRQ (IRQ_CSIS2_CSIS = SPI 296).
+		 */
+		interrupts = <GIC_SPI 303 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 296 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupt-names = "csis-dma1", "csis-link2";
+		clocks = <&cmu_top CLK_GOUT_CMU_CSIS_BUS>;
+		clock-names = "csis";
+		phys = <&mipi_phy_csis2 0>;
+		memory-region = <&camera_cma>;
+		google,csis-dma-vc = <1>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* sink from the rear ultra-wide camera (IMX386) */
+			port@0 {
+				reg = <0>;
+				csis2_sink: endpoint {
+					remote-endpoint = <&imx386_ep>;
+					data-lanes = <1 2>;
+				};
+			};
+		};
+	};
+
 	reserved-memory {
 		cont_splash_mem: splash@fac00000 {
 			/* size to be updated by actual board */
 			reg = <0x0 0xfac00000 0x0>;
 			no-map;
 			status = "disabled";
+		};
+
+		/*
+		 * Dedicated reusable CMA pool for the CSIS write-DMA buffers.
+		 * A full imx355 frame is 3280x2464x2 ~16 MB; the shared 32 MB
+		 * CMA cannot hand out that much contiguously once fragmented, so
+		 * the two mipi-csis instances draw from this pool via their
+		 * "memory-region" property. "reusable" lets the kernel use the
+		 * area for movable pages until the camera actually claims it.
+		 */
+		/*
+		 * Fixed placement (128 MiB @ 0xd0000000) in the large free gap
+		 * between the AoC/TPU carveouts (end 0x97400000) and abl
+		 * (0xf8800000). Dynamic placement (size/alloc-ranges) failed to
+		 * reserve at boot here, leaving the device on the default 32 MiB
+		 * CMA; a fixed reg is deterministic. Base and size are 4 MiB
+		 * aligned (CMA_MIN_ALIGNMENT with ARCH_FORCE_MAX_ORDER=10).
+		 */
+		camera_cma: camera-cma@d0000000 {
+			compatible = "shared-dma-pool";
+			reusable;
+			reg = <0x0 0xd0000000 0x08000000>;	/* 128 MiB */
 		};
 	};
 };
@@ -1748,6 +1820,11 @@
 		 * the divider resolves to /1. If the CMU cannot honour this, imx355
 		 * probe prints the actual rate ("external clock N is not supported").
 		 */
+		/*
+		 * gs101's whole clock tree derives from a 24.576 MHz oscillator
+		 * (no clean 24.0 MHz is available), so feed the sensor 24.576 MHz
+		 * on CIS_CLK1; the imx355 driver has matching PLL params for it.
+		 */
 		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
 		assigned-clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
 		assigned-clock-rates = <24576000>;
@@ -1811,6 +1888,7 @@
 
 		port {
 			imx386_ep: endpoint {
+				remote-endpoint = <&csis2_sink>;
 				data-lanes = <1 2>;
 				link-frequencies = /bits/ 64 <360000000>;
 			};

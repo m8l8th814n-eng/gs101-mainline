@@ -65,14 +65,19 @@
 #define IMX355_LINK_FREQ_DEFAULT	360000000LL
 #define IMX355_EXT_CLK			19200000
 /*
- * gs101/oriole clocks the sensor from CIS_CLK (osc 24.576 MHz); the CMU cannot
- * synthesise 19.2 MHz, so accept the platform's external clock too. Note the
- * mode/PLL register tables below are still computed for 19.2 MHz -- this is
- * sufficient to probe and read the chip ID, but a valid stream needs 24.576 MHz
- * mode tables.
+ * gs101/oriole feeds the sensor 24.0 MHz on CIS_CLK (the vendor camera DT uses
+ * clock-rates = <24000000>). The PLL multipliers are chosen per external clock
+ * so the same 360 MHz link (720 MHz OP VCO, 1152 MHz VT VCO) is produced from
+ * either 19.2 or 24.0 MHz -- see imx355_clk_params[]. Ported from the upstream
+ * "imx355: Add support for 24 MHz" change.
  */
-#define IMX355_EXT_CLK_GS101		24576000
+#define IMX355_EXT_CLK_24MHZ		24000000
 #define IMX355_LINK_FREQ_INDEX		0
+
+/* PLL / external-clock registers programmed per imx355_clk_params. */
+#define IMX355_REG_EXTCLK_FREQ_MHZ	0x0136
+#define IMX355_REG_PLL_VT_MPY		0x0306
+#define IMX355_REG_PLL_OP_MPY		0x030e
 
 /* number of data lanes */
 #define IMX355_DATA_LANES		4
@@ -115,6 +120,7 @@ struct imx355_hwcfg {
 struct imx355 {
 	struct device *dev;
 	struct clk *clk;
+	const struct imx355_clk_params *clk_params;
 
 	struct v4l2_subdev sd;
 	struct media_pad pad;
@@ -149,6 +155,33 @@ static const struct regulator_bulk_data imx355_supplies[] = {
 	{ .supply = "avdd" },
 	{ .supply = "dvdd" },
 	{ .supply = "dovdd" },
+};
+
+/*
+ * Per external-clock PLL parameters. extclk_freq is the EXCK_FRQ register value
+ * (MHz in 8.8 fixed point); the multipliers keep the VT/OP VCOs (1152/720 MHz)
+ * constant so the 360 MHz link is unchanged. These are written in
+ * imx355_start_streaming() after the mode table, overriding the (19.2 MHz)
+ * hardcoded values still present in the global/mode reg lists.
+ */
+struct imx355_clk_params {
+	u32 ext_clk;
+	u16 extclk_freq;
+	u16 pll_vt_mpy;
+	u16 pll_op_mpy;
+};
+
+static const struct imx355_clk_params imx355_clk_params[] = {
+	{ .ext_clk = 19200000, .extclk_freq = 0x1333, .pll_vt_mpy = 120, .pll_op_mpy = 75 },
+	{ .ext_clk = 24000000, .extclk_freq = 0x1800, .pll_vt_mpy = 96,  .pll_op_mpy = 60 },
+	/*
+	 * gs101 has no 24.0 MHz: its whole clock tree derives from a 24.576 MHz
+	 * oscillator, so the sensor is fed 24.576 MHz. Multipliers chosen to
+	 * land the VT/OP VCOs closest to the 19.2 MHz design points (1152/720):
+	 * 24.576/2 * 94 = 1155 MHz, 24.576/2 * 59 = 725 MHz (link ~362 MHz).
+	 * extclk_freq = 24.576 in 8.8 fixed point (24 = 0x18, .576*256 ~ 0x93).
+	 */
+	{ .ext_clk = 24576000, .extclk_freq = 0x1893, .pll_vt_mpy = 94, .pll_op_mpy = 59 },
 };
 
 static const struct imx355_reg imx355_global_regs[] = {
@@ -1430,6 +1463,24 @@ static int imx355_start_streaming(struct imx355 *imx355)
 		return ret;
 	}
 
+	/*
+	 * Override the external-clock frequency and PLL multipliers for the
+	 * actual input clock (the global/mode tables above hardcode the 19.2 MHz
+	 * values). Written after the mode so they take effect for this INCK.
+	 */
+	ret = imx355_write_reg(imx355, IMX355_REG_EXTCLK_FREQ_MHZ, 2,
+			       imx355->clk_params->extclk_freq);
+	if (ret)
+		return ret;
+	ret = imx355_write_reg(imx355, IMX355_REG_PLL_VT_MPY, 2,
+			       imx355->clk_params->pll_vt_mpy);
+	if (ret)
+		return ret;
+	ret = imx355_write_reg(imx355, IMX355_REG_PLL_OP_MPY, 2,
+			       imx355->clk_params->pll_op_mpy);
+	if (ret)
+		return ret;
+
 	/* set digital gain control to all color mode */
 	ret = imx355_write_reg(imx355, IMX355_REG_DPGA_USE_GLOBAL_GAIN, 1, 1);
 	if (ret)
@@ -1758,6 +1809,7 @@ static int imx355_probe(struct i2c_client *client)
 {
 	struct imx355 *imx355;
 	unsigned long freq;
+	unsigned int i;
 	int ret;
 
 	imx355 = devm_kzalloc(&client->dev, sizeof(*imx355), GFP_KERNEL);
@@ -1774,7 +1826,13 @@ static int imx355_probe(struct i2c_client *client)
 				     "failed to get clock\n");
 
 	freq = clk_get_rate(imx355->clk);
-	if (freq != IMX355_EXT_CLK && freq != IMX355_EXT_CLK_GS101)
+	for (i = 0; i < ARRAY_SIZE(imx355_clk_params); i++) {
+		if (freq == imx355_clk_params[i].ext_clk) {
+			imx355->clk_params = &imx355_clk_params[i];
+			break;
+		}
+	}
+	if (!imx355->clk_params)
 		return dev_err_probe(imx355->dev, -EINVAL,
 				     "external clock %lu is not supported\n",
 				     freq);
