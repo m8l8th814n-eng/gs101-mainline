@@ -189,10 +189,14 @@ static const struct v4l2_async_notifier_operations gs101_csis_notify_ops = {
 
 static int gs101_csis_parse_dt(struct gs101_csis *csis)
 {
-	struct fwnode_handle *ep, *remote;
+	struct fwnode_handle *ep;
 	struct v4l2_async_connection *asc;
 	int ret;
 
+	/*
+	 * v4l2_async_nf_add_fwnode_remote() takes the LOCAL endpoint (our sink)
+	 * and resolves the remote (sensor) itself.
+	 */
 	ep = fwnode_graph_get_endpoint_by_id(dev_fwnode(csis->dev),
 					     GS101_CSIS_PAD_SINK, 0,
 					     FWNODE_GRAPH_ENDPOINT_NEXT);
@@ -200,15 +204,9 @@ static int gs101_csis_parse_dt(struct gs101_csis *csis)
 		return dev_err_probe(csis->dev, -EINVAL,
 				     "no sink endpoint (sensor) in DT\n");
 
-	remote = fwnode_graph_get_remote_endpoint(ep);
-	fwnode_handle_put(ep);
-	if (!remote)
-		return dev_err_probe(csis->dev, -EINVAL,
-				     "sink endpoint has no remote\n");
-
-	asc = v4l2_async_nf_add_fwnode_remote(&csis->notifier, remote,
+	asc = v4l2_async_nf_add_fwnode_remote(&csis->notifier, ep,
 					      struct v4l2_async_connection);
-	fwnode_handle_put(remote);
+	fwnode_handle_put(ep);
 	if (IS_ERR(asc))
 		return PTR_ERR(asc);
 
