@@ -6,6 +6,7 @@
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
+#include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/pm_runtime.h>
@@ -1825,17 +1826,34 @@ static int imx355_probe(struct i2c_client *client)
 		return dev_err_probe(imx355->dev, PTR_ERR(imx355->clk),
 				     "failed to get clock\n");
 
+	/*
+	 * Pick the PLL parameter set for the closest supported external clock,
+	 * within 5%. gs101 cannot produce exactly 24.000 MHz on CIS_CLKn (no
+	 * shared-PLL tap divides to it); the vendor requests 24000000 and gets
+	 * ~23.5 MHz from shared2/2 (400 MHz / 17) while programming the sensor
+	 * with the 24 MHz tables, so a few percent of INCK error is by design.
+	 * Prefer an exact match when there is one.
+	 */
 	freq = clk_get_rate(imx355->clk);
-	for (i = 0; i < ARRAY_SIZE(imx355_clk_params); i++) {
-		if (freq == imx355_clk_params[i].ext_clk) {
-			imx355->clk_params = &imx355_clk_params[i];
-			break;
+	{
+		unsigned long best_err = ULONG_MAX;
+
+		for (i = 0; i < ARRAY_SIZE(imx355_clk_params); i++) {
+			unsigned long ref = imx355_clk_params[i].ext_clk;
+			unsigned long err = freq > ref ? freq - ref : ref - freq;
+
+			if (err * 100 <= ref * 5 && err < best_err) {
+				best_err = err;
+				imx355->clk_params = &imx355_clk_params[i];
+			}
 		}
 	}
 	if (!imx355->clk_params)
 		return dev_err_probe(imx355->dev, -EINVAL,
 				     "external clock %lu is not supported\n",
 				     freq);
+	dev_info(imx355->dev, "external clock %lu Hz -> %u MHz PLL parameters\n",
+		 freq, imx355->clk_params->ext_clk / 1000000);
 
 	ret = devm_regulator_bulk_get_const(imx355->dev,
 					    ARRAY_SIZE(imx355_supplies),

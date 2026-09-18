@@ -944,7 +944,7 @@ static int exynos_mipi_phy_init(struct phy *phy)
  * an active-low reset_n, so setting it releases the PHY (mirrors the reset
  * deassert the upstream rockchip-samsung-dcphy driver does before register I/O).
  */
-static void __maybe_unused __set_phy_reset(struct exynos_mipi_phy *state,
+static void __set_phy_reset(struct exynos_mipi_phy *state,
 			    struct mipi_phy_desc *phy_desc, unsigned int release)
 {
 	if (!state->reg_reset)
@@ -1029,6 +1029,7 @@ static int exynos_mipi_phy_configure(struct phy *phy,
 	 * if SOT/sync errors appear.
 	 */
 	info[SETTLE] = 0x10;
+	(void)info;			/* only consumed by the (disabled) preset */
 
 	/*
 	 * The D-PHY SFR bank must be OUT of reset while these analog/timing
@@ -1042,18 +1043,24 @@ static int exynos_mipi_phy_configure(struct phy *phy,
 	 * never assert here. Safe whether the boot state is in-reset (the release
 	 * makes the bank accessible) or already released (the release is a no-op).
 	 */
-#if 0	/*
-	 * TEST (c) 2026-09-18: do NOT touch the CSIS reset sysreg at all. The
-	 * bootloader leaves 0x1A420500 = 0 and the vendor phy driver never writes
-	 * it, yet stock streams -- so writing bit N = 1 here is unmotivated. The
-	 * earlier bisect only proved "phy_configure() freezes"; it never split
-	 * this sysreg write from the first PHY-bank write that follows it. If
-	 * the sysreg is TZPC-protected (pablo has "if sysreg_is is secure, skip
-	 * phy reset" for exactly this), THIS write is the freeze, not the bank.
+	/*
+	 * TEST (f) 2026-09-18: do exactly what the stock HAL does and nothing
+	 * more. RE of liblyric_hwl.so (register-name table @0x1078f40) shows the
+	 * HAL touches only m1_dphy_sNc_gnr_con0 (this PHY's clock-lane GNR_CON0)
+	 * and, in SYSREG_CSIS 0x500, sets the PHY's reset bit at stream start.
+	 * Neither the vendor phy driver (isolation only), LWIS, ABL, bl2, bl31
+	 * nor tzsw writes any other DCPHY register, and the bank reads all-zero
+	 * at boot -- so the hardware defaults ARE the working configuration and
+	 * the vendor "0504" preset below (dead code in the vendor tree) is what
+	 * we do differently. (TEST (c) had proven the sysreg write itself is not
+	 * a freeze; the stack overrun was.)
 	 */
-	__set_phy_reset(state, phy_desc, 1);		/* release, keep released */
-#endif
+	__set_phy_reset(state, phy_desc, 1);		/* release, as the HAL does */
+	writel(0x00000001, phy_desc->regs + 0x0000);	/* SC_GNR_CON0 = enable, as the HAL does */
+	ret = 0;
+#if 0	/* vendor 0504 preset: NOT run on stock, see TEST (f) above */
 	ret = cfg->set(phy_desc->regs, 0, info);
+#endif
 
 	return ret;
 }

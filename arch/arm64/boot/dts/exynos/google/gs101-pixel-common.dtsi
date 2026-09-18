@@ -1875,14 +1875,19 @@
 		 * the divider resolves to /1. If the CMU cannot honour this, imx355
 		 * probe prints the actual rate ("external clock N is not supported").
 		 */
-		/*
-		 * gs101's whole clock tree derives from a 24.576 MHz oscillator
-		 * (no clean 24.0 MHz is available), so feed the sensor 24.576 MHz
-		 * on CIS_CLK1; the imx355 driver has matching PLL params for it.
-		 */
 		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
-		assigned-clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
-		assigned-clock-rates = <24576000>;
+		/*
+		 * Vendor (gs101-oriole-camera.dtsi) runs the imx355 INCK from
+		 * CIS_CLK1 at a requested 24000000 Hz with the sensor's 24 MHz
+		 * PLL tables, not from the raw 24.576 MHz oscillator. No shared
+		 * PLL tap divides to exactly 24 MHz; parent shared2/2 = 400 MHz
+		 * gives 400/17 = 23.53 MHz, which the sensor tolerates (the driver
+		 * matches the 24 MHz table within 5%).
+		 */
+		assigned-clocks = <&cmu_top CLK_MOUT_CMU_CIS_CLK1>,
+				  <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
+		assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_SHARED2_DIV2>;
+		assigned-clock-rates = <0>, <24000000>;
 
 		reset-gpios = <&gpp4 2 GPIO_ACTIVE_LOW>;
 
@@ -1943,8 +1948,11 @@
 		reg = <0x1a>;
 
 		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
-		assigned-clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
-		assigned-clock-rates = <24576000>;
+		/* Vendor: CIS_CLK0 requested at 24000000 (24 MHz sensor tables); see imx355. */
+		assigned-clocks = <&cmu_top CLK_MOUT_CMU_CIS_CLK0>,
+				  <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
+		assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_SHARED2_DIV2>;
+		assigned-clock-rates = <0>, <24000000>;
 
 		reset-gpios = <&gpp6 3 GPIO_ACTIVE_LOW>;
 

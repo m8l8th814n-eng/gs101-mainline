@@ -528,7 +528,7 @@ static const struct gs101_pd_desc gs101_pd_pdp = {
 
 #define GS101_PD_QCH_MAX	64
 
-static void gs101_csis_pd_cycle(struct gs101_csis *csis,
+static void __maybe_unused gs101_csis_pd_cycle(struct gs101_csis *csis,
 				const struct gs101_pd_desc *pd)
 {
 	void __iomem *cmu = ioremap(pd->cmu_base, 0x4000);
@@ -642,10 +642,19 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 	 * link read back fine afterwards -- so that cycle is real and was not
 	 * the missing precondition.)
 	 */
+#if 0	/*
+	 * TEST (e) 2026-09-18: pd cycle DISABLED. Hypothesis: the vendor Linux
+	 * path never programs the DCPHY analog registers (vendor phy driver =
+	 * isolation only, HAL = gnr_con0 + phy_cmn_ctrl only, per the HAL
+	 * register table), so the PHY must come up with usable hardware
+	 * defaults and our pd_csis OFF->ON wiped them to the zeros we read.
+	 * Boot fresh, do NOT cycle, bypass isolation, read the bank.
+	 */
 	gs101_csis_pd_cycle(csis, &gs101_pd_csis);
 	gs101_csis_pd_cycle(csis, &gs101_pd_pdp);
 	dev_info(csis->dev, "pd cycle: CSIS version now 0x%08x\n",
 		 readl(csis->link + CSIS_REG_VERSION));
+#endif
 
 	/* Bring up the D-PHY for the active link (link0 for now). */
 	if (csis->num_phys) {
@@ -661,6 +670,12 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 		}
 
 #if 0	/*
+		 * (TEST (e) answered: boot defaults are ZERO even without the pd
+		 * cycle, so the cycle wiped nothing. Bail off again; pd cycle stays
+		 * off. Next: sensor streaming + PHY configured, force the
+		 * MIPI_PHY_LINK_WRAP ACLK gate to manual from userspace and watch
+		 * PHY_STATUS.)
+		 *
 		 * DIAG 2026-09-18 (devmem2 probe) -- ANSWERED: with the PHY left
 		 * powered here, the full vendor DCPHY0 register sequence replayed
 		 * from userspace (phy-bank-write-probe.sh) succeeded with every

@@ -65,13 +65,16 @@
 #define IMX386_LINK_FREQ_DEFAULT	360000000LL
 #define IMX386_EXT_CLK			19200000
 /*
- * gs101/oriole clocks the sensor from CIS_CLK (osc 24.576 MHz); the CMU cannot
- * synthesise 19.2 MHz, so accept the platform's external clock too. Note the
- * mode/PLL register tables below are still computed for 19.2 MHz -- this is
- * sufficient to probe and read the chip ID, but a valid stream needs 24.576 MHz
- * mode tables.
+ * The register tables below are written for a 24 MHz INCK (EXCK_FRQ 0x1800,
+ * VT PLL 24/3*56, OP PLL 24/12*114), which is also what the vendor
+ * gs101-oriole-camera.dtsi requests for this sensor (clock-rates 24000000).
+ * gs101 cannot divide a shared PLL to exactly 24 MHz; CIS_CLK0 from shared2/2
+ * (~400 MHz / 17) gives ~23.5 MHz, which the sensor tolerates. Accept the
+ * external clock within 5% of 24 MHz (and the raw 19.2 MHz of the original
+ * platform).
  */
-#define IMX386_EXT_CLK_GS101		24576000
+#define IMX386_EXT_CLK_24MHZ		24000000
+#define IMX386_EXT_CLK_TOLERANCE_PCT	5
 #define IMX386_LINK_FREQ_INDEX		0
 
 /* number of data lanes */
@@ -1087,10 +1090,18 @@ static int imx386_probe(struct i2c_client *client)
 				     "failed to get clock\n");
 
 	freq = clk_get_rate(imx386->clk);
-	if (freq != IMX386_EXT_CLK && freq != IMX386_EXT_CLK_GS101)
-		return dev_err_probe(imx386->dev, -EINVAL,
-				     "external clock %lu is not supported\n",
-				     freq);
+	{
+		unsigned long err = freq > IMX386_EXT_CLK_24MHZ ?
+				    freq - IMX386_EXT_CLK_24MHZ :
+				    IMX386_EXT_CLK_24MHZ - freq;
+
+		if (freq != IMX386_EXT_CLK &&
+		    err * 100 > IMX386_EXT_CLK_24MHZ * IMX386_EXT_CLK_TOLERANCE_PCT)
+			return dev_err_probe(imx386->dev, -EINVAL,
+					     "external clock %lu is not supported\n",
+					     freq);
+	}
+	dev_info(imx386->dev, "external clock %lu Hz (tables are for 24 MHz)\n", freq);
 
 	ret = devm_regulator_bulk_get_const(imx386->dev,
 					    ARRAY_SIZE(imx386_supplies),
