@@ -995,7 +995,15 @@ static int exynos_mipi_phy_configure(struct phy *phy,
 	unsigned int lanes = dphy->lanes ? dphy->lanes : 4;
 	u32 speed_mbps = div_u64(dphy->hs_clk_rate, 1000000);
 	const struct exynos_mipi_phy_cfg *cfg;
-	u32 info[4];
+	/*
+	 * Indexed by enum phy_infos (VERSION..SETTLE = 0..4): FIVE entries.
+	 * This was u32 info[4], so info[SETTLE] wrote one word past the array
+	 * and corrupted this function's stack frame -> silent death in
+	 * phy_configure() on every STREAMON, misread for weeks as a bus/TZPC
+	 * freeze of the DCPHY bank (2026-09-18: the identical register
+	 * sequence replayed from userspace worked, which exposed this).
+	 */
+	u32 info[SETTLE + 1];
 	u16 minor;
 	int ret;
 
@@ -1011,6 +1019,7 @@ static int exynos_mipi_phy_configure(struct phy *phy,
 		return -EINVAL;
 	}
 
+	info[VERSION] = MKVER(0x0504, minor);
 	info[TYPE] = 0x000D << 16;		/* D-PHY mode */
 	info[LANES] = lanes - 1;
 	info[SPEED] = speed_mbps;

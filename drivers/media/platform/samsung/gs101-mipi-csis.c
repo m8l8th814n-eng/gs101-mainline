@@ -486,92 +486,122 @@ static void gs101_csis_return_buffers(struct gs101_csis *csis,
 }
 
 /*
- * TEST (d) 2026-09-18: stock-exact pd_csis power CYCLE before the PHY is
- * touched. Every other precondition is eliminated (clock state identical to
- * stock, isolation bypass verified, reset sysreg untouched like stock, my
- * SMCs irrelevant, EL3 priv_reg proxy refused) and the first DCPHY bank write
- * (0x1A4F1300 / M_BIAS 0x1A4F1000) still freezes the SoC. The ONE thing stock
- * does at every camera open that we have never done: genpd powers pd_csis
- * OFF at boot (unused) and back ON at open, running vendor pmucal_local
- * disable/enable = save CMU_CSIS/SYSREG state -> tz_save SMC -> CSIS
+ * TEST (d) 2026-09-18: stock-exact power CYCLE of the camera domains before
+ * the PHY is touched. Every other precondition is eliminated (clock state
+ * identical to stock, isolation bypass verified, reset sysreg untouched like
+ * stock, my SMCs irrelevant, EL3 priv_reg proxy refused, PMIC rails on) and
+ * the first DCPHY bank write (0x1A4F1300 / M_BIAS 0x1A4F1000) still freezes
+ * the SoC. What stock does at every camera open that we never did: genpd
+ * powers the domains OFF at boot (unused) and back ON at open, running vendor
+ * pmucal_local disable/enable = save CMU/SYSREG state -> tz_save SMC ->
  * CONFIGURATION bit0=0 -> wait STATUS=0, then bit0=1 -> wait STATUS=1 ->
- * tz_restore SMC -> restore saved state. We run from the bootloader's
- * never-cycled state; a real OFF->ON resets the domain (and lets bl31 apply
- * its TZPC config on the way up). Offsets: flexpmu_cal_local_gs101.h
- * csis_save[]/csis_on[]/csis_off[], exynos-pd_el3.c, pmucal_local.c.
- * PMU_ALIVE writes must go through SMC_CMD_PRIV_REG (EL1 writes are dropped).
+ * tz_restore SMC -> restore saved state. Vendor DT: lwis_csi (links + PHY +
+ * WDMA) lives in pd_pdp, and pd_csis is held by the two CSIS SYSMMUs, so at
+ * camera open BOTH come up (csis first via the iommu device link, then pdp).
+ * pd_csis alone was verified to cycle cleanly (1->0->1, all SMCs 0) and did
+ * not help. Offsets: flexpmu_cal_local_gs101.h csis_xxx and pdp_xxx tables,
+ * exynos-pd_el3.c, pmucal_local.c. PMU_ALIVE writes go via SMC_CMD_PRIV_REG.
  * Remove once the freeze is understood.
  */
-#define GS101_PD_CSIS_QCH_FIRST	0x3048	/* QCH_CON_CSISX8_QCH_C2_CSIS */
-#define GS101_PD_CSIS_QCH_LAST	0x3110	/* QCH_CON_SYSREG_CSIS_QCH */
-#define GS101_PD_CSIS_QCH_NUM	((GS101_PD_CSIS_QCH_LAST - GS101_PD_CSIS_QCH_FIRST) / 4 + 1)
+struct gs101_pd_desc {
+	const char *name;
+	u32 pmu_cfg;		/* PMU_ALIVE CONFIGURATION reg (STATUS = +4) */
+	u32 tz_addr;		/* need_smc: D_TZPC base + 0x204 */
+	u32 cmu_base;		/* block CMU */
+	u32 sysreg_base;	/* block SYSREG */
+	u32 qch_first, qch_last;
+	bool has_vra_mux;	/* PDP also has PLL_CON0_MUX_CLKCMU_PDP_VRA_USER @0x610 */
+};
 
-static void gs101_csis_pd_cycle(struct gs101_csis *csis)
+static const struct gs101_pd_desc gs101_pd_csis = {
+	.name = "csis", .pmu_cfg = 0x17462400, .tz_addr = 0x1A410204,
+	.cmu_base = 0x1A400000, .sysreg_base = 0x1A420000,
+	.qch_first = 0x3048, .qch_last = 0x3110,	/* CSISX8_C2 .. SYSREG_CSIS */
+};
+
+static const struct gs101_pd_desc gs101_pd_pdp = {
+	.name = "pdp", .pmu_cfg = 0x17462480, .tz_addr = 0x1AA10204,
+	.cmu_base = 0x1AA00000, .sysreg_base = 0x1AA20000,
+	.qch_first = 0x304c, .qch_last = 0x30d0,	/* D_TZPC_PDP .. VRA */
+	.has_vra_mux = true,
+};
+
+#define GS101_PD_QCH_MAX	64
+
+static void gs101_csis_pd_cycle(struct gs101_csis *csis,
+				const struct gs101_pd_desc *pd)
 {
-	void __iomem *cmu = ioremap(0x1A400000, 0x4000);
-	void __iomem *sysreg = ioremap(0x1A420000, 0x200);
-	void __iomem *pmu = ioremap(0x17462400, 0x8);
-	u32 qch[GS101_PD_CSIS_QCH_NUM];
-	u32 busp, pll, opt, drcg, memclk, st;
+	void __iomem *cmu = ioremap(pd->cmu_base, 0x4000);
+	void __iomem *sysreg = ioremap(pd->sysreg_base, 0x200);
+	void __iomem *pmu = ioremap(pd->pmu_cfg, 0x8);
+	unsigned int nqch = (pd->qch_last - pd->qch_first) / 4 + 1;
+	u32 qch[GS101_PD_QCH_MAX];
+	u32 busp, pll, vra = 0, opt, drcg, memclk, st;
 	struct arm_smccc_res res;
 	int i, t;
 
-	if (!cmu || !sysreg || !pmu) {
-		dev_err(csis->dev, "pd cycle: ioremap failed\n");
+	if (!cmu || !sysreg || !pmu || nqch > GS101_PD_QCH_MAX) {
+		dev_err(csis->dev, "pd cycle %s: ioremap failed\n", pd->name);
 		goto out;
 	}
 
-	/* pmucal_rae_save_seq(csis_save) */
-	busp = readl(cmu + 0x1800);		/* CLK_CON_DIV_DIV_CLK_CSIS_BUSP */
-	pll = readl(cmu + 0x0600);		/* PLL_CON0_MUX_CLKCMU_CSIS_BUS_USER */
-	for (i = 0; i < GS101_PD_CSIS_QCH_NUM; i++)
-		qch[i] = readl(cmu + GS101_PD_CSIS_QCH_FIRST + i * 4);
-	opt = readl(cmu + 0x0800);		/* CSIS_CMU_CSIS_CONTROLLER_OPTION */
-	drcg = readl(sysreg + 0x0104);		/* SYSREG_CSIS_BUS_COMPONENT_DRCG_EN */
-	memclk = readl(sysreg + 0x0108);	/* SYSREG_CSIS_MEMCLK */
-	dev_info(csis->dev, "pd cycle: saved busp=0x%x pll=0x%x opt=0x%x qch0=0x%x drcg=0x%x memclk=0x%x status=0x%x\n",
-		 busp, pll, opt, qch[0], drcg, memclk, readl(pmu + 0x4));
+	/* pmucal_rae_save_seq(<pd>_save) */
+	busp = readl(cmu + 0x1800);		/* CLK_CON_DIV_DIV_CLK_<PD>_BUSP */
+	pll = readl(cmu + 0x0600);		/* PLL_CON0_MUX_CLKCMU_<PD>_BUS_USER */
+	if (pd->has_vra_mux)
+		vra = readl(cmu + 0x0610);	/* PLL_CON0_MUX_CLKCMU_PDP_VRA_USER */
+	for (i = 0; i < nqch; i++)
+		qch[i] = readl(cmu + pd->qch_first + i * 4);
+	opt = readl(cmu + 0x0800);		/* <PD>_CMU_<PD>_CONTROLLER_OPTION */
+	drcg = readl(sysreg + 0x0104);		/* SYSREG_<PD>_BUS_COMPONENT_DRCG_EN */
+	memclk = readl(sysreg + 0x0108);	/* SYSREG_<PD>_MEMCLK */
+	dev_info(csis->dev, "pd cycle %s: saved busp=0x%x pll=0x%x opt=0x%x qch0=0x%x drcg=0x%x memclk=0x%x status=0x%x\n",
+		 pd->name, busp, pll, opt, qch[0], drcg, memclk, readl(pmu + 0x4));
 
-	/* exynos_pd_tz_save(0x1A410204) */
-	arm_smccc_smc(0x82000410, 0 /*EXYNOS_GET_IN_PD_DOWN*/, 0x1A410204,
+	/* exynos_pd_tz_save(need_smc) */
+	arm_smccc_smc(0x82000410, 0 /*EXYNOS_GET_IN_PD_DOWN*/, pd->tz_addr,
 		      2 /*RUNTIME_PM_TZPC_GROUP*/, 0, 0, 0, 0, &res);
-	dev_info(csis->dev, "pd cycle: tz_save ret=0x%lx\n", res.a0);
+	dev_info(csis->dev, "pd cycle %s: tz_save ret=0x%lx\n", pd->name, res.a0);
 
-	/* csis_off: CSIS_CONFIGURATION bit0=0, wait CSIS_STATUS bit0==0 */
-	arm_smccc_smc(0x82000504, 0x17462400, 2 /*PRIV_REG_OPTION_RMW*/, 0x1, 0x0,
+	/* <pd>_off: CONFIGURATION bit0=0, wait STATUS bit0==0 */
+	arm_smccc_smc(0x82000504, pd->pmu_cfg, 2 /*PRIV_REG_OPTION_RMW*/, 0x1, 0x0,
 		      0, 0, 0, &res);
 	for (t = 1000; t && (readl(pmu + 0x4) & 0x1); t--)
 		udelay(10);
 	st = readl(pmu + 0x4);
-	dev_info(csis->dev, "pd cycle: OFF priv ret=0x%lx status=0x%x %s\n",
-		 res.a0, st, (st & 1) ? "(TIMEOUT, still on)" : "(off)");
+	dev_info(csis->dev, "pd cycle %s: OFF priv ret=0x%lx status=0x%x %s\n",
+		 pd->name, res.a0, st, (st & 1) ? "(TIMEOUT, still on)" : "(off)");
 
-	/* csis_on: CSIS_CONFIGURATION bit0=1, wait CSIS_STATUS bit0==1 */
-	arm_smccc_smc(0x82000504, 0x17462400, 2, 0x1, 0x1, 0, 0, 0, &res);
+	/* <pd>_on: CONFIGURATION bit0=1, wait STATUS bit0==1 */
+	arm_smccc_smc(0x82000504, pd->pmu_cfg, 2, 0x1, 0x1, 0, 0, 0, &res);
 	for (t = 1000; t && !(readl(pmu + 0x4) & 0x1); t--)
 		udelay(10);
 	st = readl(pmu + 0x4);
-	dev_info(csis->dev, "pd cycle: ON priv ret=0x%lx status=0x%x %s\n",
-		 res.a0, st, (st & 1) ? "(on)" : "(TIMEOUT, still off)");
+	dev_info(csis->dev, "pd cycle %s: ON priv ret=0x%lx status=0x%x %s\n",
+		 pd->name, res.a0, st, (st & 1) ? "(on)" : "(TIMEOUT, still off)");
 
-	/* exynos_pd_tz_restore(0x1A410204) */
-	arm_smccc_smc(0x82000410, 1 /*EXYNOS_WAKEUP_PD_DOWN*/, 0x1A410204, 2,
+	/* exynos_pd_tz_restore(need_smc) */
+	arm_smccc_smc(0x82000410, 1 /*EXYNOS_WAKEUP_PD_DOWN*/, pd->tz_addr, 2,
 		      0, 0, 0, 0, &res);
-	dev_info(csis->dev, "pd cycle: tz_restore ret=0x%lx\n", res.a0);
+	dev_info(csis->dev, "pd cycle %s: tz_restore ret=0x%lx\n", pd->name, res.a0);
 
-	/* pmucal_rae_restore_seq(csis_save), table order */
+	if (!(st & 1)) {
+		dev_err(csis->dev, "pd cycle %s: domain did not come back, skipping restore\n",
+			pd->name);
+		goto out;
+	}
+
+	/* pmucal_rae_restore_seq(<pd>_save), table order */
 	writel(busp, cmu + 0x1800);
+	if (pd->has_vra_mux)
+		writel(vra, cmu + 0x0610);
 	writel(pll, cmu + 0x0600);
-	for (i = GS101_PD_CSIS_QCH_NUM - 1; i >= 0; i--)
-		writel(qch[i], cmu + GS101_PD_CSIS_QCH_FIRST + i * 4);
+	for (i = nqch - 1; i >= 0; i--)
+		writel(qch[i], cmu + pd->qch_first + i * 4);
 	writel(opt, cmu + 0x0800);
 	writel(drcg, sysreg + 0x0104);
 	writel(memclk, sysreg + 0x0108);
-	if (st & 1)
-		dev_info(csis->dev, "pd cycle: restored; CSIS version now 0x%08x\n",
-			 readl(csis->link + CSIS_REG_VERSION));
-	else
-		dev_err(csis->dev, "pd cycle: domain did not come back, skipping link read\n");
+	dev_info(csis->dev, "pd cycle %s: restored\n", pd->name);
 out:
 	if (pmu)
 		iounmap(pmu);
@@ -605,8 +635,17 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = 0;
 	}
 
-	/* TEST (d): power-cycle pd_csis like stock does at every camera open. */
-	gs101_csis_pd_cycle(csis);
+	/*
+	 * TEST (d'): power-cycle pd_csis AND pd_pdp like stock does at every
+	 * camera open. (DIAG bail removed 2026-09-18: pd_csis alone was seen to
+	 * cycle cleanly, status 1->0->1 with all SMCs returning 0, and the CSIS
+	 * link read back fine afterwards -- so that cycle is real and was not
+	 * the missing precondition.)
+	 */
+	gs101_csis_pd_cycle(csis, &gs101_pd_csis);
+	gs101_csis_pd_cycle(csis, &gs101_pd_pdp);
+	dev_info(csis->dev, "pd cycle: CSIS version now 0x%08x\n",
+		 readl(csis->link + CSIS_REG_VERSION));
 
 	/* Bring up the D-PHY for the active link (link0 for now). */
 	if (csis->num_phys) {
@@ -620,6 +659,18 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 			phy_exit(csis->phys[0]);
 			goto err_stop_pipe;
 		}
+
+#if 0	/*
+		 * DIAG 2026-09-18 (devmem2 probe) -- ANSWERED: with the PHY left
+		 * powered here, the full vendor DCPHY0 register sequence replayed
+		 * from userspace (phy-bank-write-probe.sh) succeeded with every
+		 * value read back. The "freeze" was a stack overrun in
+		 * exynos_mipi_phy_configure() (u32 info[4] indexed by SETTLE=4).
+		 */
+		dev_info(csis->dev, "DIAG: PHY left powered, bailing before phy_configure; run phy-bank-probe.sh\n");
+		ret = -EINVAL;
+		goto err_stop_pipe;
+#endif
 
 		/*
 		 * DIAG: RE confirmed the DCPHY is programmed from NORMAL world
