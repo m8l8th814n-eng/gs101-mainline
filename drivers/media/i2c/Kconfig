@@ -959,6 +959,17 @@ config VIDEO_LM3560
 	  This is a driver for the lm3560 dual flash controllers. It controls
 	  flash, torch LEDs.
 
+config VIDEO_LM3644
+	tristate "LM3644 dual flash driver support"
+	depends on I2C && VIDEO_DEV
+	select MEDIA_CONTROLLER
+	select REGMAP_I2C
+	select V4L2_ASYNC
+	help
+	  This is a driver for the TI LM3644 dual flash controller. It controls
+	  flash, torch and IR LEDs, and drives the hardware-enable/strobe GPIOs.
+	  Used for the camera flash on Pixel 6 (gs101).
+
 config VIDEO_LM3646
 	tristate "LM3646 dual flash driver support"
 	depends on I2C && VIDEO_DEV

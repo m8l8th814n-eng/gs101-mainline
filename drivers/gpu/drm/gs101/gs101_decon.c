@@ -263,6 +263,7 @@ static void gs101_decon_atomic_disable(struct drm_crtc *crtc,
 {
 	struct gs101_decon *decon = crtc_to_decon(crtc);
 
+	drm_crtc_vblank_off(crtc);
 	gs101_decon_hw_stop(decon);
 
 	if (crtc->state->event && !crtc->state->active) {

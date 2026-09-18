@@ -944,7 +944,7 @@ static int exynos_mipi_phy_init(struct phy *phy)
  * an active-low reset_n, so setting it releases the PHY (mirrors the reset
  * deassert the upstream rockchip-samsung-dcphy driver does before register I/O).
  */
-static void __set_phy_reset(struct exynos_mipi_phy *state,
+static void __maybe_unused __set_phy_reset(struct exynos_mipi_phy *state,
 			    struct mipi_phy_desc *phy_desc, unsigned int release)
 {
 	if (!state->reg_reset)
@@ -957,13 +957,8 @@ static int exynos_mipi_phy_power_on(struct phy *phy)
 {
 	struct mipi_phy_desc *phy_desc = phy_get_drvdata(phy);
 	struct exynos_mipi_phy *state = to_mipi_video_phy(phy_desc);
-	int ret;
 
-	ret = __set_phy_state(state, phy_desc, 1);
-	if (ret)
-		return ret;
-	__set_phy_reset(state, phy_desc, 1);	/* release from reset */
-	return 0;
+	return __set_phy_state(state, phy_desc, 1);
 }
 
 static int exynos_mipi_phy_power_off(struct phy *phy)
@@ -971,7 +966,6 @@ static int exynos_mipi_phy_power_off(struct phy *phy)
 	struct mipi_phy_desc *phy_desc = phy_get_drvdata(phy);
 	struct exynos_mipi_phy *state = to_mipi_video_phy(phy_desc);
 
-	__set_phy_reset(state, phy_desc, 0);	/* hold in reset */
 	return __set_phy_state(state, phy_desc, 0);
 }
 
@@ -996,12 +990,14 @@ static int exynos_mipi_phy_configure(struct phy *phy,
 				     union phy_configure_opts *opts)
 {
 	struct mipi_phy_desc *phy_desc = phy_get_drvdata(phy);
+	struct exynos_mipi_phy *state = to_mipi_video_phy(phy_desc);
 	struct phy_configure_opts_mipi_dphy *dphy = &opts->mipi_dphy;
 	unsigned int lanes = dphy->lanes ? dphy->lanes : 4;
 	u32 speed_mbps = div_u64(dphy->hs_clk_rate, 1000000);
 	const struct exynos_mipi_phy_cfg *cfg;
 	u32 info[4];
 	u16 minor;
+	int ret;
 
 	/* DCphy minor: 0x0000 = 4-lane, 0x0001 = 2-lane. */
 	minor = (lanes >= 4) ? 0x0000 : 0x0001;
@@ -1025,7 +1021,32 @@ static int exynos_mipi_phy_configure(struct phy *phy,
 	 */
 	info[SETTLE] = 0x10;
 
-	return cfg->set(phy_desc->regs, 0, info);
+	/*
+	 * The D-PHY SFR bank must be OUT of reset while these analog/timing
+	 * registers are written -- cfg->set() does its own analog reset via the
+	 * SC/SD_GNR_CON0 enable bits (write 0 to disable, configure, write 1 to
+	 * enable), which only works if the bank is accessible. Our earlier code
+	 * ASSERTED sysreg reset around cfg->set(), holding phy2 in reset while it
+	 * was written -> SFR-bus stall -> silent EL3 reset (device death on
+	 * STREAMON). The vendor phy driver never touches this sysreg reset at all
+	 * (the D-PHYs are left released by the bootloader), so: release only, and
+	 * never assert here. Safe whether the boot state is in-reset (the release
+	 * makes the bank accessible) or already released (the release is a no-op).
+	 */
+#if 0	/*
+	 * TEST (c) 2026-09-18: do NOT touch the CSIS reset sysreg at all. The
+	 * bootloader leaves 0x1A420500 = 0 and the vendor phy driver never writes
+	 * it, yet stock streams -- so writing bit N = 1 here is unmotivated. The
+	 * earlier bisect only proved "phy_configure() freezes"; it never split
+	 * this sysreg write from the first PHY-bank write that follows it. If
+	 * the sysreg is TZPC-protected (pablo has "if sysreg_is is secure, skip
+	 * phy reset" for exactly this), THIS write is the freeze, not the bank.
+	 */
+	__set_phy_reset(state, phy_desc, 1);		/* release, keep released */
+#endif
+	ret = cfg->set(phy_desc->regs, 0, info);
+
+	return ret;
 }
 
 static struct phy_ops exynos_mipi_phy_ops = {

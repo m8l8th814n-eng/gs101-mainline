@@ -906,7 +906,6 @@
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1008>;
 			status = "okay";
-			samsung,mode = <USI_MODE_I2C>;   /* USI_MODE_I2C = 3 kuken */
 
 			hsi2c_3: i2c@10920000 {
 				compatible = "google,gs101-hsi2c",
@@ -1894,6 +1893,22 @@
 			compatible = "google,gs101-hsi2-sysreg", "syscon";
 			reg = <0x14420000 0x10000>;
 			clocks = <&cmu_hsi2 CLK_GOUT_HSI2_SYSREG_HSI2_PCLK>;
+		};
+
+		cmu_csis: clock-controller@1a400000 {
+			compatible = "google,gs101-cmu-csis";
+			reg = <0x1a400000 0x10000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_CSIS_BUS>;
+			clock-names = "oscclk", "bus";
+			samsung,sysreg = <&sysreg_csis>;
+		};
+
+		sysreg_csis: syscon@1a420000 {
+			compatible = "google,gs101-csis-sysreg", "syscon";
+			reg = <0x1a420000 0x10000>;
+			clocks = <&cmu_csis CLK_GOUT_CSIS_SYSREG_CSIS_PCLK>;
 		};
 
 		pinctrl_hsi2: pinctrl@14440000 {

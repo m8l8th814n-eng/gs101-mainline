@@ -685,6 +685,12 @@ static const struct regulator_ops s2mpg10_reg_buck_ops[] = {
 	[S2MPG10_REGULATOR_OPS_EXTCONTROL] = {
 		.list_voltage		= regulator_list_voltage_linear_range,
 		.map_voltage		= regulator_map_voltage_linear_range,
+		/*
+		 * Diagnostic: report the enable-mode bits (EXT control programmed)
+		 * so the sysfs "state" attribute is not empty for these. The real
+		 * output follows the AP PWREN pin, which is high while Linux runs.
+		 */
+		.is_enabled		= regulator_is_enabled_regmap,
 		.enable			= s2mpg10_regulator_enable_nop,
 		.get_voltage_sel	= regulator_get_voltage_sel_regmap,
 		.set_voltage_sel	= regulator_set_voltage_sel_regmap,
@@ -775,6 +781,12 @@ static const struct regulator_ops s2mpg10_reg_ldo_ops[] = {
 	[S2MPG10_REGULATOR_OPS_EXTCONTROL] = {
 		.list_voltage		= regulator_list_voltage_linear_range,
 		.map_voltage		= regulator_map_voltage_linear_range,
+		/*
+		 * Diagnostic: report the enable-mode bits (EXT control programmed)
+		 * so the sysfs "state" attribute is not empty for these. The real
+		 * output follows the AP PWREN pin, which is high while Linux runs.
+		 */
+		.is_enabled		= regulator_is_enabled_regmap,
 		.enable			= s2mpg10_regulator_enable_nop,
 		.get_voltage_sel	= regulator_get_voltage_sel_regmap,
 		.set_voltage_sel	= regulator_set_voltage_sel_regmap,
@@ -798,6 +810,12 @@ static const struct regulator_ops s2mpg10_reg_ldo_ramp_ops[] = {
 	[S2MPG10_REGULATOR_OPS_EXTCONTROL] = {
 		.list_voltage		= regulator_list_voltage_linear_range,
 		.map_voltage		= regulator_map_voltage_linear_range,
+		/*
+		 * Diagnostic: report the enable-mode bits (EXT control programmed)
+		 * so the sysfs "state" attribute is not empty for these. The real
+		 * output follows the AP PWREN pin, which is high while Linux runs.
+		 */
+		.is_enabled		= regulator_is_enabled_regmap,
 		.enable			= s2mpg10_regulator_enable_nop,
 		.get_voltage_sel	= regulator_get_voltage_sel_regmap,
 		.set_voltage_sel	= regulator_set_voltage_sel_regmap,
@@ -1034,6 +1052,12 @@ static const struct regulator_ops s2mpg11_reg_buck_ops[] = {
 	[S2MPG10_REGULATOR_OPS_EXTCONTROL] = {
 		.list_voltage		= regulator_list_voltage_linear_range,
 		.map_voltage		= regulator_map_voltage_linear_range,
+		/*
+		 * Diagnostic: report the enable-mode bits (EXT control programmed)
+		 * so the sysfs "state" attribute is not empty for these. The real
+		 * output follows the AP PWREN pin, which is high while Linux runs.
+		 */
+		.is_enabled		= regulator_is_enabled_regmap,
 		.enable			= s2mpg10_regulator_enable_nop,
 		.get_voltage_sel	= regulator_get_voltage_sel_regmap,
 		.set_voltage_sel	= regulator_set_voltage_sel_regmap,

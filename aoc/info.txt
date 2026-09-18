@@ -1,0 +1,132 @@
+================================================================================
+ gs101 (Google Pixel 6 / oriole) speaker audio on mainline Linux 7.2
+ postmarketOS, AoC -> TDM_0 -> cs35l41 (cs35l41dna) -- notes & fixes
+================================================================================
+
+OVERVIEW
+--------
+Speaker output path:   PipeWire -> AoC (Always-on Compute) -> TDM_0 bus ->
+                       two cs35l41 smart amps (SPI: spi13.0 = L/top,
+                       spi13.1 = R/bottom), driven by the ported "cs35l41dna"
+                       driver. Control over SPI, audio over TDM_0.
+No Android audio HAL is present (this is postmarketOS/Alpine/musl), so anything
+the HAL normally programs (mixer routing, per-endpoint ring geometry, tuning)
+has to be done by the kernel driver, ALSA state, or a small setup script.
+
+
+THE "STUDS" / BEAT-REPEAT ARTIFACT  (root cause + fix)
+-----------------------------------------------------
+Symptom: rhythmic chunk-repeat on playback ("Ableton beat-repeat"); a separate
+"broken synth" garble in another configuration.
+
+Isolation proved:
+  * Not the amp: raw ASP vs calibrated DSP vs DRE all sounded identical.
+  * Not PipeWire/WirePlumber: present even with direct `aplay -M hw:0,0`.
+  * It was the AoC playback ENDPOINT + ring GEOMETRY.
+
+Source of truth: /etc/audio_platform_configuration.xml (usecase_attr).
+`dev1` in that file == the ALSA pcm device number. Each usecase has a fixed
+ring geometry the AoC firmware expects:
+  EP1  = hw:0,0 = "Pro 0" = UC_MMAP_PLAYBACK  = MMAP_NOIRQ, block 48 frames
+  EP2  = hw:0,1 = UC_LOW_LATENCY              = 480 frames x 4
+  EP6  = hw:0,5 = "Pro 5" = UC_DEEP_BUFFER    = 960 frames (20 ms) x 4  <- speaker
+  ...
+The Android HAL opens each endpoint with exactly this geometry. With no HAL,
+PipeWire negotiated an arbitrary period (1024/12288) that misaligned with the
+firmware block -> glitch on the deep-buffer endpoint, and on the free-running
+MMAP endpoint the poll clock drifted -> repeat.
+
+FIX (in the driver, so no userspace hack is needed):
+  aoc/alsa/aoc_alsa_pcm.c snd_aoc_pcm_open() now pins each playback endpoint to
+  its config geometry (frame-exact, 48 kHz):
+      idx 0  -> 48  x 40   (UC_MMAP_PLAYBACK)
+      idx 1  -> 480 x 4    (UC_LOW_LATENCY)
+      idx 5  -> 960 x 4    (UC_DEEP_BUFFER, speaker)
+      idx 30 -> 480 x 3    (UC_IMMERSIVE)
+  Any app (PipeWire included) now gets the correct geometry automatically.
+  Verified clean by ear on EP1 at period 48 (the true MMAP block).
+
+
+MODULE LOAD ORDER  (it is enforced in the code)
+-----------------------------------------------
+aoc.c declares its probe-time deps so modprobe loads them first, even on
+autoload:
+    MODULE_SOFTDEP("pre: samsung-iommu mailbox-wc");     (aoc.c)
+If the IOMMU domain is not ready yet, probe returns -EPROBE_DEFER and re-runs
+when the SysMMU registers (aoc.c, "no iommu domain yet, deferring"). This is
+why early -517 (EPROBE_DEFER) messages at boot are benign -- the card still
+binds on retry.
+
+Not covered by the softdep:
+  * gsa    - resolved via the "gsa-device" phandle + deferred probe (self-heals)
+  * trusty - SSMT via tipc is best-effort, not a hard probe dep. If you want
+             SSMT programmed at autoload, extend the softdep:
+                 MODULE_SOFTDEP("pre: samsung-iommu mailbox-wc trusty-core");
+
+A LATE burst of -517 (long after boot) is NOT the ordering system -- it means
+AoC crashed and restarted (see disable_restart below).
+
+
+AUTOLOAD (instead of running aoc.sh by hand)
+--------------------------------------------
+The aoc modules are blacklisted in /etc/modprobe.d/blacklist.conf (aoc_core,
+aoc_alsa_dev, aoc_alsa_dev_util, aoc_char_dev, aoc_control_dev,
+aoc_channel_dev). Uncomment those to let them autoload; cs35l41dna is not
+blacklisted and binds via its SPI node. /etc/modprobe.d/cs35l41dna.conf only
+blacklists the *upstream* cs35l41 so the dna driver wins.
+
+Module parameters: aoc_core defaults are now the ones we want, so no
+/etc/modprobe.d options line is needed:
+    aoc_early_magic    = 0  (already the default)
+    aoc_disable_restart= 1  (changed to default true; AoC restart does not
+                             recover cleanly on gs101, it wedges its suppliers)
+    aoc_disable_mm     = 0  (left at default = Monitor Mode ON)
+Autoloading modules brings the card up but does NOT set the mixer routing --
+that still needs `audiofix-dna.sh setup` or an alsactl restore (below).
+
+
+alsamixer / alsactl store  (control readability fixes)
+------------------------------------------------------
+Several controls refused reads and aborted alsactl store / alsamixer for the
+whole card. Fixed so every control that advertises READ is actually readable:
+  * aoc_alsa_ctl.c: "Voice Call Rx Volume", "VOIP Rx Volume" (stub get),
+    "HAC AMP EN" (no GPIO on this board -> report 0, no-op the set),
+    "compr offload volume" (clamp instead of -EINVAL). Hotword "not supported"
+    demoted from pr_err to pr_debug.
+  * ../sound/soc/codecs/wm_adsp.c: volatile HALO coefficient controls (e.g.
+    "... HALO_STATE") advertise READ but cs_dsp returns -EPERM while the DSP is
+    powered down. wm_coeff_get()/wm_coeff_tlv_get() now report zeros/cache on
+    -EPERM instead of failing, so the control stays readable.
+After a rebuild, `sudo alsactl store` completes cleanly.
+
+
+PERSISTENCE (avoid running setup every boot)
+--------------------------------------------
+Option A -- ALSA state (works now that store succeeds):
+    1. get the mixer into the wanted state, AMP OFF:  sudo sh audiofix-dna.sh setup
+    2. snapshot:                                      sudo alsactl store
+    3. restore at boot:                               sudo rc-update add alsa default
+   Store with the amp OFF so restore does not enable it at boot (idle heat);
+   the amp turns on when playback needs it.
+   Timing: alsactl restore must run AFTER the aoc modules load and the amps
+   probe (else the controls do not exist yet). If aoc loads late, run
+   `alsactl restore` from that late step instead of the generic alsa service.
+
+Option B -- late boot service running `audiofix-dna.sh setup` directly (only
+touches the controls that matter; avoids poking dead subsystems).
+
+
+FILES / SCRIPTS
+---------------
+  audiofix-dna.sh   - routing/params bring-up (setup / raw / dsp / on / off / play)
+  audiofix-cal.sh   - CSPL calibration (measure -> apply); optional DSP path only
+  LJUDRECEPT.md     - on-device recipe summary
+  mixer_paths.xml, audio_platform_configuration.xml - the vendor recipe / source
+                      of truth (min_etc)
+
+Kernel commits (m8l8th814n-eng/linux-mainline, branch gs101-7.2):
+  aoc: alsa: pin per-endpoint ring geometry for HAL-less playback
+  aoc: alsa: make Voice Call / VOIP Rx Volume readable; quiet hotword warn
+  aoc: alsa: make HAC AMP EN and compr offload volume readable
+  ASoC: wm_adsp: keep READ controls readable while the DSP is powered down
+  (pending) aoc: default aoc_disable_restart=1

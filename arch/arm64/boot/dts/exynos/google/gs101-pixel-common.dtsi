@@ -260,8 +260,22 @@
 		interrupts = <GIC_SPI 302 IRQ_TYPE_LEVEL_HIGH 0>,
 			     <GIC_SPI 294 IRQ_TYPE_LEVEL_HIGH 0>;
 		interrupt-names = "csis-dma0", "csis-link0";
-		clocks = <&cmu_top CLK_GOUT_CMU_CSIS_BUS>;
-		clock-names = "csis";
+		/*
+		 * CMU_CSIS leaf gates for this link + its WDMA context, from the
+		 * generated cmu_csis block: APB bridge, CSIS core, WDMA, elastic
+		 * buffer, this context's QoS engine, the D-PHY link wrapper, plus the
+		 * ACPM CAM DVFS domain (stock LWIS votes 67 MHz at device enable).
+		 */
+		clocks = <&cmu_csis CLK_GOUT_CSIS_AD_APB_CSIS0_PCLKM>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_C2_CSIS>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_CSIS_DMA>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_EBUF>,
+			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA0_ACLK>,
+			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA0_PCLK>,
+			 <&cmu_csis CLK_GOUT_CSIS_MIPI_PHY_LINK_WRAP_ACLK_CSIS0>,
+			 <&acpm_ipc GS101_CLK_ACPM_DVFS_CAM>;
+		clock-names = "apb", "c2", "dma", "ebuf", "qe-aclk", "qe-pclk",
+			      "phy-wrap", "cam-dvfs";
 		phys = <&mipi_phy_csis0 0>;
 		memory-region = <&camera_cma>;
 		google,csis-dma-vc = <0>;
@@ -298,8 +312,22 @@
 		interrupts = <GIC_SPI 303 IRQ_TYPE_LEVEL_HIGH 0>,
 			     <GIC_SPI 296 IRQ_TYPE_LEVEL_HIGH 0>;
 		interrupt-names = "csis-dma1", "csis-link2";
-		clocks = <&cmu_top CLK_GOUT_CMU_CSIS_BUS>;
-		clock-names = "csis";
+		/*
+		 * CMU_CSIS leaf gates for this link + its WDMA context, from the
+		 * generated cmu_csis block: APB bridge, CSIS core, WDMA, elastic
+		 * buffer, this context's QoS engine, the D-PHY link wrapper, plus the
+		 * ACPM CAM DVFS domain (stock LWIS votes 67 MHz at device enable).
+		 */
+		clocks = <&cmu_csis CLK_GOUT_CSIS_AD_APB_CSIS0_PCLKM>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_C2_CSIS>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_CSIS_DMA>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_EBUF>,
+			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA1_ACLK>,
+			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA1_PCLK>,
+			 <&cmu_csis CLK_GOUT_CSIS_MIPI_PHY_LINK_WRAP_ACLK_CSIS2>,
+			 <&acpm_ipc GS101_CLK_ACPM_DVFS_CAM>;
+		clock-names = "apb", "c2", "dma", "ebuf", "qe-aclk", "qe-pclk",
+			      "phy-wrap", "cam-dvfs";
 		phys = <&mipi_phy_csis2 0>;
 		memory-region = <&camera_cma>;
 		google,csis-dma-vc = <1>;
@@ -463,6 +491,8 @@
 				// needs to be on during boot, until all consumers have
 				// probed and established their links to this
 				regulator-boot-on;
+				/* Vendor gs101-pmic.dtsi: always-on (feeds an internal PMIC LDO group). */
+				regulator-always-on;
 			};
 
 			s2mpg10_buck9m: buck9m {
@@ -473,6 +503,8 @@
 				// needs to be on during boot, until all consumers have
 				// probed and established their links to this
 				regulator-boot-on;
+				/* Vendor gs101-pmic.dtsi: always-on (feeds an internal PMIC LDO group). */
+				regulator-always-on;
 			};
 
 			buck10m {
@@ -762,6 +794,8 @@
 				regulator-min-microvolt = <450000>;
 				regulator-max-microvolt = <1300000>;
 				regulator-ramp-delay = <6250>;
+				/* Vendor gs101-pmic.dtsi: always-on (feeds an internal PMIC LDO group). */
+				regulator-always-on;
 			};
 
 			buck4s {
@@ -788,6 +822,8 @@
 				regulator-min-microvolt = <1000000>;
 				regulator-max-microvolt = <1500000>;
 				regulator-ramp-delay = <6250>;
+				/* Vendor gs101-pmic.dtsi: always-on (feeds an internal PMIC LDO group). */
+				regulator-always-on;
 			};
 
 			s2mpg11_buck7s: buck7s {
@@ -795,6 +831,8 @@
 				regulator-min-microvolt = <1500000>;
 				regulator-max-microvolt = <2200000>;
 				regulator-ramp-delay = <6250>;
+				/* Vendor gs101-pmic.dtsi: always-on (feeds an internal PMIC LDO group). */
+				regulator-always-on;
 			};
 
 			buck8s_reg: buck8s {
@@ -1294,6 +1332,23 @@
 		interrupt-parent = <&gpa8>;
 		interrupts = <0 IRQ_TYPE_LEVEL_HIGH>;
 		reset-gpios = <&gpp24 2 GPIO_ACTIVE_HIGH>;
+	};
+
+	/*
+	 * LM3644 dual-LED camera flash (rear). Vendor drives it via its own
+	 * LWIS framework ("google,lwis-i2c-device"); mainline binds the TI
+	 * V4L2 flash subdev instead. Wiring from gs101 RE:
+	 *   HW enable  = gpp23[6], active-high (AP2FLASH_EN)
+	 *   ext strobe = gpp27[0], active-low  (optional; SW strobe over I2C
+	 *                works without it)
+	 * The front camera (imx355) has no LED flash.
+	 */
+	flash@63 {
+		compatible = "ti,lm3644";
+		reg = <0x63>;
+
+		enable-gpios = <&gpp23 6 GPIO_ACTIVE_HIGH>;
+		strobe-gpios = <&gpp27 0 GPIO_ACTIVE_LOW>;
 	};
 
 	/*
@@ -1831,6 +1886,14 @@
 
 		reset-gpios = <&gpp4 2 GPIO_ACTIVE_LOW>;
 
+		/*
+		 * KNOWN-GOOD rails (imx355 binds on I2C with these). The
+		 * production LWIS "ldo1 + ldo_dummy" model does NOT translate to
+		 * the mainline regulator model: dvdd/dovdd physically come from the
+		 * real SLG LDOs (ldo6/ldo7), not hardwired board rails, so pointing
+		 * them at fixed cam_dvdd/cam_dovdd (software no-ops) drops physical
+		 * dvdd/dovdd -> sensor unpowered -> -EIO on the chip-id read.
+		 */
 		avdd-supply = <&slg51000_ldo3>;		/* 2.8 V */
 		dvdd-supply = <&slg51000_ldo6>;		/* 1.2 V */
 		dovdd-supply = <&slg51000_ldo7>;	/* 1.8 V */
@@ -1861,6 +1924,12 @@
 	};
 };
 
+/* Enable the USI3 wrapper in I2C mode so hsi2c_3 (rear camera bus) comes up. */
+&usi3 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
 /*
  * Rear ultra-wide camera: Sony IMX386 on HSI2C bus 3 (@0x1a). 2-lane MIPI,
  * CIS_CLK0 on sensor_mclk1 (gpp3-0). Proto1 rails: avdd=ldo2, dvdd=ldo5,
@@ -1879,6 +1948,7 @@
 
 		reset-gpios = <&gpp6 3 GPIO_ACTIVE_LOW>;
 
+		/* KNOWN-GOOD proto1-style rails (real SLG LDOs, like imx355). */
 		avdd-supply = <&slg51000_ldo2>;
 		dvdd-supply = <&slg51000_ldo5>;
 		dovdd-supply = <&slg51000_ldo7>;
