@@ -20,10 +20,12 @@
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 #include <linux/string.h>
 #include <linux/phy/phy.h>
 
@@ -61,7 +63,19 @@
 #define GS101_CSIS_DMA_CTX_STRIDE	0x1000	/* per DMA context */
 #define GS101_CSIS_DMA_VC_STRIDE	0x100	/* per VC channel in a context */
 #define GS101_CSIS_DMA_CTL_OFFSET	0x400	/* ctl/common block in a context */
-#define GS101_CSIS_DMA_MUX_OFFSET	0x500	/* input mux (link select) */
+#define GS101_CSIS_DMA_MUX_OFFSET	0x500	/* input mux (link select) -- WRONG register, see hw_start */
+
+/*
+ * SYSREG_CSIS (0x1A420000) WDMA routing, as the stock HAL programs it
+ * (liblyric csi_context.cc, bank 0xb): a "slot" register per link input
+ * (0x430 + slot * 4 = csis link number), a per-WDMA-context mux (0x408 +
+ * ctx * 4 = slot) and one enable bit per (link, ctx) pair in 0x488
+ * (1 << (link + ctx * 8)). The link index alone is not enough for the
+ * receiver to reach the DMA. We use slot = ctx.
+ */
+#define GS101_SYSREG_CSIS_LINK_SLOT(slot)	(0x430 + (slot) * 4)
+#define GS101_SYSREG_CSIS_DMA_MUX(ctx)		(0x408 + (ctx) * 4)
+#define GS101_SYSREG_CSIS_DMA_EN		0x488
 
 /* Capture uses virtual channel 0, MIPI CSI-2 data type RAW10 (0x2b). */
 #define GS101_CSIS_VC0			0
@@ -84,14 +98,75 @@ struct gs101_csis_buffer {
 	dma_addr_t		addr;
 };
 
+/*
+ * EBUF handling at stream start: 0 = program it like pablo (default),
+ * 1 = bypass it. Runtime switch so both can be tried on one build
+ * (/sys/module/gs101_mipi_csis/parameters/ebuf_bypass).
+ */
+static bool gs101_csis_ebuf_bypass = true;	/* 2026-09-19: only bypass captures */
+module_param_named(ebuf_bypass, gs101_csis_ebuf_bypass, bool, 0644);
+MODULE_PARM_DESC(ebuf_bypass, "bypass the CSIS elastic buffer (default 1; 0 = program it like pablo)");
+
+/*
+ * Bring-up knobs (2026-09-19): the stock HAL writes csis_dma0_ch0_fmt = 0x1e,
+ * which does not decode in the pablo v5.4 field layout we use (DATAFORMAT
+ * 6 = U10 unpack MSB zero, 2D), and pablo sets the link's PIXEL_MODE to
+ * QUAD for the OTF path while we use SINGLE. Both only take effect before
+ * the first frame, so they are runtime parameters rather than rebuilds.
+ */
+static unsigned int gs101_csis_dma_fmt = 6;
+module_param_named(dma_fmt, gs101_csis_dma_fmt, uint, 0644);
+MODULE_PARM_DESC(dma_fmt, "raw value for the WDMA channel FMT register (default 6)");
+
+static unsigned int gs101_csis_pixel_mode = 2;	/* 2026-09-19: QUAD = 3/3 captures, single = link overflow */
+module_param_named(pixel_mode, gs101_csis_pixel_mode, uint, 0644);
+MODULE_PARM_DESC(pixel_mode, "link ISP_CONFIG PIXEL_MODE: 0 single, 1 dual, 2 quad (default 2)");
+
+/*
+ * WDMA context override (-1 = the DT google,csis-dma-vc). 2026-09-19: the
+ * rear on context 1 gets frame-ends but all-zero buffers while the front on
+ * context 0 captures; running the rear on context 0 tells whether it is the
+ * context (its AXI port) or the link. Only one instance may stream while set.
+ */
+static int gs101_csis_dma_ctx;	/* 2026-09-19: rear on ctx0 captures, on ctx1 all zeros -> 0 for now */
+module_param_named(dma_ctx, gs101_csis_dma_ctx, int, 0644);
+MODULE_PARM_DESC(dma_ctx, "force WDMA context 0..3 for every instance (default 0; -1 = DT)");
+
+/*
+ * EBUFn_CTRL_EN raw value when the EBUF is programmed (ebuf_bypass=0).
+ * pablo sets only ABORT_CTRL_EN (bit1) = 0x2; the stock HAL builds its
+ * ebuf0_ctrl_en from the constant 0x2c (csi_context.cc, decomp 2026-09-19).
+ */
+static unsigned int gs101_csis_ebuf_ctrl_en = 0x2;
+module_param_named(ebuf_ctrl_en, gs101_csis_ebuf_ctrl_en, uint, 0644);
+MODULE_PARM_DESC(ebuf_ctrl_en, "raw EBUFn_CTRL_EN value (default 0x2, HAL uses 0x2c)");
+
+/*
+ * SYSREG_CSIS routing slot (EBUF channel) to use; -1 = the instance's WDMA
+ * context number (front: 0, rear: 1). 2026-09-19: the rear on slot/ctx 1 got
+ * no frames at all in EBUF bypass while the front on slot/ctx 0 captured, so
+ * slot 0 for a single stream is a thing to try before blaming ctx1.
+ */
+static int gs101_csis_sysreg_slot;	/* 2026-09-19: slot 1 routed nothing, slot 0 captured the rear */
+module_param_named(sysreg_slot, gs101_csis_sysreg_slot, int, 0644);
+MODULE_PARM_DESC(sysreg_slot, "SYSREG_CSIS routing slot (default 0; -1 = WDMA context number)");
+
+/* WDMA DATA_CTRL input path for channel 0: 0 = OTF (pablo default), 1 = PRL. */
+static bool gs101_csis_dma_input_prl;
+module_param_named(dma_input_prl, gs101_csis_dma_input_prl, bool, 0644);
+MODULE_PARM_DESC(dma_input_prl, "WDMA ch0 input path 1 = parallel, 0 = OTF (default)");
+
 struct gs101_csis {
 	struct device		*dev;
 	void __iomem		*link;		/* csis-link0 */
 	void __iomem		*dma;		/* csis-dma (WDMA) */
+	void __iomem		*ebuf;		/* csis-ebuf (elastic buffer), optional */
 	struct clk_bulk_data	*clks;
 	int			num_clks;
 	/* ACPM CAM DVFS domain (clock-names "cam-dvfs"); stock LWIS votes 67 MHz. */
 	struct clk		*cam_dvfs;
+	/* SYSREG_CSIS syscon ("samsung,sysreg"): WDMA input routing. */
+	struct regmap		*sysreg;
 	struct phy		*phys[GS101_CSIS_NUM_PHYS];
 	int			num_phys;
 
@@ -128,6 +203,8 @@ struct gs101_csis {
 	 * on MIPI VC0, so capture uses channel 0 of the context.
 	 */
 	unsigned int			dma_ch;
+	/* WDMA context whose IRQ this instance owns (DT google,csis-dma-vc). */
+	unsigned int			irq_ctx;
 	unsigned int			link_idx;
 
 	/* MIPI CSI-2 data lanes for this instance (imx355=4, imx386=2). */
@@ -167,7 +244,7 @@ static int gs101_csis_init_state(struct v4l2_subdev *sd,
 	fmt = v4l2_subdev_state_get_format(state, GS101_CSIS_PAD_SINK);
 	fmt->width = GS101_CSIS_DEF_WIDTH;
 	fmt->height = GS101_CSIS_DEF_HEIGHT;
-	fmt->code = MEDIA_BUS_FMT_SGRBG10_1X10;
+	fmt->code = MEDIA_BUS_FMT_SRGGB10_1X10;	/* was SGRBG10: the sensors send RGGB */
 	fmt->field = V4L2_FIELD_NONE;
 	fmt->colorspace = V4L2_COLORSPACE_RAW;
 
@@ -223,8 +300,17 @@ static void gs101_csis_hw_set_dma_addr(struct gs101_csis *csis, dma_addr_t addr)
 
 	is_hw_set_reg(vc, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_ADDR1],
 		      lower_32_bits(addr));
-	seq = is_hw_get_reg(vc, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FCNTSEQ]);
-	is_hw_set_reg(vc, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FCNTSEQ], seq | 1);
+	/*
+	 * FRAMECNT_SEQ: one bit per address slot that holds a valid buffer;
+	 * the channel walks the set bits with ACTIVE_FRAMEPTR. Its reset value
+	 * is all ones, so "seq | 1" (pablo's idiom on a register pablo has
+	 * cleared elsewhere) left every slot enabled and the DMA cycled through
+	 * ADDR2..ADDR32 = 0 -> writes to address 0 -> OTF OVERLAP + ABORTED on
+	 * every frame (seen live 2026-09-18: frameptr advancing 0x1f,0,4,9 with
+	 * only slot 0 programmed). We use slot 0 only.
+	 */
+	seq = BIT(0);
+	is_hw_set_reg(vc, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FCNTSEQ], seq);
 }
 
 /*
@@ -252,6 +338,112 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 	u32 h = csis->pixfmt.height;
 	u32 val;
 
+	/*
+	 * WDMA common block (0x1A4D0000 + 0x8, CSIS_CMN_DMA_CTRL): IP_PROCESSING
+	 * = 1 enables the DMA IP's Q-channel clock (pablo csi_hw_s_dma_common /
+	 * csi_hw_dma_common_reset(on)). 2026-09-18: with it left at the reset
+	 * value 0 the WDMA never wrote a line and its INT_SRC showed a permanent
+	 * ABORT_DONE (bit 13) -> level IRQ storm (11 M interrupts) although the
+	 * link had HS lock and counted frames. Shared by both link instances;
+	 * left on at stop (pablo clears it only for power-off).
+	 */
+	/*
+	 * WDMA common SW reset first (pablo csi_hw_dma_common_reset(on): set
+	 * SW_RESET, poll until the block clears it, then IP_PROCESSING = 1).
+	 * Without it the channel keeps its state across streams: after the
+	 * first 8 frames the channel counter (ACT FRAMECNT 0x708) froze and no
+	 * later stream ever latched ACTIVE_ENABLE. Done here, before the link
+	 * and the sensor run, where pablo does it (never tried from userspace:
+	 * the device froze after a stream stop before that test, 2026-09-18).
+	 * The block is shared by both link instances, so this also resets a
+	 * stream running on the other one; simultaneous front+rear capture is
+	 * not supported yet.
+	 */
+	{
+		unsigned int retry = 10;
+
+		is_hw_set_field(csis->dma,
+				&csi_cmn_dma_regs[CSIS_CMN_DMA_R_CSIS_CMN_DMA_CTRL],
+				&csi_cmn_dma_fields[CSIS_CMN_DMA_F_SW_RESET], 1);
+		while (--retry) {
+			if (is_hw_get_field(csis->dma,
+					    &csi_cmn_dma_regs[CSIS_CMN_DMA_R_CSIS_CMN_DMA_CTRL],
+					    &csi_cmn_dma_fields[CSIS_CMN_DMA_F_SW_RESET]) != 1)
+				break;
+			udelay(10);
+		}
+		if (!retry)
+			dev_warn(csis->dev, "WDMA common SW reset did not clear\n");
+	}
+	val = is_hw_get_reg(csis->dma,
+			    &csi_cmn_dma_regs[CSIS_CMN_DMA_R_CSIS_CMN_DMA_CTRL]);
+	val = is_hw_set_field_value(val,
+				    &csi_cmn_dma_fields[CSIS_CMN_DMA_F_IP_PROCESSING], 1);
+	val = is_hw_set_field_value(val,
+				    &csi_cmn_dma_fields[CSIS_CMN_DMA_F_SW_RESET], 0);
+	is_hw_set_reg(csis->dma, &csi_cmn_dma_regs[CSIS_CMN_DMA_R_CSIS_CMN_DMA_CTRL],
+		      val);
+	/*
+	 * CSIS_CMN_DMA_CLK_CTRL bit0 CLKGATE_OFF: the stock HAL writes this
+	 * register at WDMA init (csis_cmn_dma_clk_ctrl, value built with its
+	 * set-bit helper); reset value 0 = the DMA IP gates its own clock.
+	 * pablo never touches it. Added 2026-09-19 while the WDMA still never
+	 * latched ACTIVE_ENABLE (OTF OVERLAP + ABORTED on every frame with the
+	 * slot/sequence/routing/EBUF all in place).
+	 */
+	is_hw_set_field(csis->dma, &csi_cmn_dma_regs[CSIS_CMN_DMA_R_CSIS_CMN_DMA_CLK_CTRL],
+			&csi_cmn_dma_fields[CSIS_CMN_DMA_F_CLKGATE_OFF], 1);
+
+	/*
+	 * EBUF (elastic buffer, 0x1A4C0000) sits between the links and the
+	 * WDMA. Its bypass bit reads 0 at boot here (pablo's reset value is 1)
+	 * with nothing else programmed -> the data never reached the DMA.
+	 * 2026-09-18, live on link4: bypass = 1 from userspace made the WDMA
+	 * see frame starts at once (OVERLAP IRQs); pablo's full EBUF setup
+	 * (chid size, ctrl_en, num_of_cameras, bypass 0) did not. Bypass it.
+	 */
+	if (csis->ebuf && gs101_csis_ebuf_bypass) {
+		is_hw_set_field(csis->ebuf, &csi_ebuf_regs[CSIS_EBUF_R_EBUF_CTRL],
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUF_BYPASS], 1);
+	} else if (csis->ebuf) {
+		/*
+		 * Real EBUF setup, pablo csi_hw_s_ebuf_enable(on, ebuf_ch, mode) +
+		 * csi_hw_s_cfg_ebuf(ebuf_ch, vc, w, h), ebuf_ch = our SYSREG slot
+		 * = dma_ch, vc 0. The EBUF re-times the OTF stream for the WDMA
+		 * (OUT_MIN_HBLANK); in bypass the WDMA saw only OTF OVERLAP on
+		 * every frame and never latched ACTIVE_ENABLE (2026-09-18), so
+		 * this is the default and bypass stays as the module parameter.
+		 * Interrupt mask not enabled (no EBUF IRQ handler yet).
+		 */
+		void __iomem *eb = csis->ebuf;
+		unsigned int ch = gs101_csis_sysreg_slot < 0 ?
+				  csis->dma_ch : gs101_csis_sysreg_slot;
+		const struct is_reg *r_ctrl_en =
+			&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_CTRL_EN + 6 * ch];
+		const struct is_reg *r_sync =
+			&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_OUT_SYNC_CTRL + 6 * ch];
+		const struct is_reg *r_size =
+			&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_CHID0_SIZE + 6 * ch];
+
+		is_hw_set_field(eb, r_size,
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_CHIDX_SIZE_V], h);
+		is_hw_set_field(eb, r_size,
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_CHIDX_SIZE_H], w / 4);
+		is_hw_set_field(eb, &csi_ebuf_regs[CSIS_EBUF_R_EBUF_CTRL],
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUF_BYPASS], 0);
+		is_hw_set_reg(eb, r_ctrl_en, gs101_csis_ebuf_ctrl_en);
+		is_hw_set_field(eb, r_sync,
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_OUT_MIN_HBLANK], 0x10);
+#if 0	/* pablo's two field writes, replaced by the raw ebuf_ctrl_en parameter */
+		is_hw_set_field(eb, r_ctrl_en,
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_ABORT_CTRL_EN], 1);
+		is_hw_set_field(eb, r_ctrl_en,
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_ABORT_AUTO_GEN_FAKE], 0);
+#endif
+		is_hw_set_field(eb, &csi_ebuf_regs[CSIS_EBUF_R_EBUF_NUM_OF_CAMERAS],
+				&csi_ebuf_fields[CSIS_EBUF_F_NUM_OF_CAMERAS], 1);
+	}
+
 	/* Link soft reset. */
 	is_hw_set_field(link, &csi_regs[CSIS_R_CSIS_CMN_CTRL],
 			&csi_fields[CSIS_F_SW_RESET], 1);
@@ -271,7 +463,7 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 	val = is_hw_set_field_value(val, &csi_fields[CSIS_F_DATAFORMAT],
 				    GS101_CSIS_DT_RAW10);
 	val = is_hw_set_field_value(val, &csi_fields[CSIS_F_PIXEL_MODE],
-				    CSIS_PIXEL_MODE_SING);
+				    gs101_csis_pixel_mode);	/* was CSIS_PIXEL_MODE_SING */
 	is_hw_set_reg(link, &csi_regs[cfg], val);
 
 	val = is_hw_get_reg(link, &csi_regs[resol]);
@@ -280,19 +472,47 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 	is_hw_set_reg(link, &csi_regs[resol], val);
 
 	/*
-	 * WDMA input mux: route this CSIS link into the context (pablo writes
-	 * the link index to regs_mux before configuring the DMA).
+	 * WDMA input routing lives in SYSREG_CSIS (stock HAL), not in the DMA
+	 * context bank: slot -> link, ctx -> slot, then the (link, ctx) enable
+	 * bit. 2026-09-18: the old write below went to ctx + 0x500 (read back
+	 * 0 forever) -- wrong register.
 	 */
+	if (csis->sysreg) {
+		unsigned int slot = gs101_csis_sysreg_slot < 0 ?
+				    csis->dma_ch : gs101_csis_sysreg_slot;
+
+		regmap_write(csis->sysreg,
+			     GS101_SYSREG_CSIS_LINK_SLOT(slot), csis->link_idx);
+		regmap_write(csis->sysreg,
+			     GS101_SYSREG_CSIS_DMA_MUX(csis->dma_ch), slot);
+		regmap_update_bits(csis->sysreg, GS101_SYSREG_CSIS_DMA_EN,
+				   BIT(csis->link_idx + csis->dma_ch * 8),
+				   BIT(csis->link_idx + csis->dma_ch * 8));
+	}
+#if 0	/* pablo-style mux write into the DMA context: not this hardware's register */
 	writel(csis->link_idx, ctx + GS101_CSIS_DMA_MUX_OFFSET);
+#endif
+
+	/* DMA input path for ch0 (pablo csi_hw_s_config_dma_cmn: OTF unless potf). */
+	is_hw_set_field(ctl, &csi_dmax_regs[CSIS_DMAX_R_DATA_CTRL],
+			&csi_dmax_fields[CSIS_DMAX_F_DMA_INPUT_PATH_CH0],
+			gs101_csis_dma_input_prl ? 1 : 0);
 
 	/* WDMA VC0: 2D, RAW10 unpacked to 16-bit, resolution, stride. */
-	val = is_hw_get_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT]);
-	val = is_hw_set_field_value(val, &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_DIM],
-				    CSIS_REG_DMA_2D_DMA);
-	val = is_hw_set_field_value(val,
-				    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_DATAFORMAT],
-				    CSIS_DMA_FMT_U10BIT_UNPACK_MSB_ZERO);
-	is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT], val);
+	if (gs101_csis_dma_fmt != 6) {
+		/* raw override, see the dma_fmt parameter */
+		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT],
+			      gs101_csis_dma_fmt);
+	} else {
+		val = is_hw_get_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT]);
+		val = is_hw_set_field_value(val,
+					    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_DIM],
+					    CSIS_REG_DMA_2D_DMA);
+		val = is_hw_set_field_value(val,
+					    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_DATAFORMAT],
+					    CSIS_DMA_FMT_U10BIT_UNPACK_MSB_ZERO);
+		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT], val);
+	}
 
 	val = is_hw_get_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_RESOL]);
 	val = is_hw_set_field_value(val, &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_HRESOL], w);
@@ -305,8 +525,35 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 
 	gs101_csis_hw_set_dma_addr(csis, addr);
 
+	/*
+	 * Frame pointer: the channel's ACTIVE_FRAMEPTR resets to 0x1f (slot
+	 * 31) and only moves when UPDT_PTR_EN is set together with the slot
+	 * (pablo csi_hw_s_frameptr). We fill slot 0 (ADDR1, FCNTSEQ bit 0), so
+	 * point it there or every frame start hits an empty slot (OTF OVERLAP
+	 * with nothing written, seen live 2026-09-18).
+	 */
+	val = is_hw_get_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_CTRL]);
+	val = is_hw_set_field_value(val,
+				    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_UPDT_PTR_EN], 1);
+	val = is_hw_set_field_value(val,
+				    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_UPDT_FRAMEPTR], 0);
+	/*
+	 * DMA_ENABLE stays 0 here. 2026-09-19: with identical settings some
+	 * streams captured and some died from the first frame (OTF OVERLAP +
+	 * ACTIVE_ABORTED, channel dead until the common SW reset) -- the
+	 * channel was enabled before the sensor ran and took its first frame
+	 * boundary wherever the sensor happened to be. pablo enables the DMA
+	 * per frame from the link FRAME_START handler, i.e. always on a
+	 * boundary; we enable it in start_streaming after the link has seen
+	 * a FRAMEEND (gs101_csis_wait_frame_boundary).
+	 */
+	val = is_hw_set_field_value(val,
+				    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_DMA_ENABLE], 0);
+	is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_CTRL], val);
+#if 0	/* replaced by the pointer-aware write above (2026-09-18) */
 	is_hw_set_field(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_CTRL],
 			&csi_dmax_chx_fields[CSIS_DMAX_CHX_F_DMA_ENABLE], 1);
+#endif
 
 	/* Enable DMA frame interrupts. */
 	is_hw_set_reg(ctl, &csi_dmax_regs[CSIS_DMAX_R_INT_ENABLE],
@@ -327,6 +574,20 @@ static void gs101_csis_hw_stop(struct gs101_csis *csis)
 	void __iomem *ctx = gs101_csis_ctx(csis);
 	void __iomem *vc0 = ctx;				/* channel 0 */
 	void __iomem *ctl = ctx + GS101_CSIS_DMA_CTL_OFFSET;
+
+	/* Release the EBUF channel (pablo csi_hw_s_ebuf_enable(off)). */
+	if (csis->ebuf && !gs101_csis_ebuf_bypass) {
+		unsigned int ch = gs101_csis_sysreg_slot < 0 ?
+				  csis->dma_ch : gs101_csis_sysreg_slot;
+
+		is_hw_set_field(csis->ebuf,
+				&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_CTRL_EN + 6 * ch],
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_ABORT_CTRL_EN], 0);
+		is_hw_set_field(csis->ebuf, &csi_ebuf_regs[CSIS_EBUF_R_EBUF_NUM_OF_CAMERAS],
+				&csi_ebuf_fields[CSIS_EBUF_F_NUM_OF_CAMERAS], 0);
+		is_hw_set_field(csis->ebuf, &csi_ebuf_regs[CSIS_EBUF_R_EBUF_CTRL],
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUF_BYPASS], 1);
+	}
 
 	/*
 	 * Debug: FRM_CNT > 0 means the link received frames from the sensor
@@ -356,13 +617,26 @@ static void gs101_csis_hw_stop(struct gs101_csis *csis)
 	is_hw_set_reg(ctl, &csi_dmax_regs[CSIS_DMAX_R_INT_ENABLE], 0);
 }
 
+/*
+ * Which instance currently streams on each WDMA context. The DMA IRQ lines
+ * are per context and requested per instance from the DT (csis-dma%u), so
+ * with the dma_ctx override the rear can run on context 0 whose IRQ lands in
+ * the front instance: dispatch to the owner instead.
+ */
+static struct gs101_csis *gs101_csis_ctx_owner[4];
+
 static irqreturn_t gs101_csis_irq(int irq, void *data)
 {
 	struct gs101_csis *csis = data;
-	void __iomem *ctl = gs101_csis_ctx(csis) + GS101_CSIS_DMA_CTL_OFFSET;
+	void __iomem *ctl;
 	u32 src;
 
 	u32 err;
+
+	if (csis->irq_ctx < 4 && gs101_csis_ctx_owner[csis->irq_ctx] &&
+	    gs101_csis_ctx_owner[csis->irq_ctx] != csis)
+		csis = gs101_csis_ctx_owner[csis->irq_ctx];
+	ctl = gs101_csis_ctx(csis) + GS101_CSIS_DMA_CTL_OFFSET;
 
 	src = is_hw_get_reg(ctl, &csi_dmax_regs[CSIS_DMAX_R_INT_SRC]);
 	if (!src)
@@ -372,6 +646,11 @@ static irqreturn_t gs101_csis_irq(int irq, void *data)
 	/*
 	 * Channel-0 write errors: the frame that just completed (if any) is
 	 * not trustworthy, hand it back as ERROR instead of silently DONE.
+	 */
+	/*
+	 * ABORT_DONE (bit 13) is a state flag, not an error: it stays asserted
+	 * while the DMA IP is idle/aborted (seen permanently with IP_PROCESSING
+	 * = 0, see hw_start). Not an error and not a frame either.
 	 */
 	err = src & (BIT(CSIS_INT_DMA_FIFO_FULL) |
 		     BIT(CSIS_INT_DMA_LASTDATA_ERROR) |
@@ -611,6 +890,55 @@ out:
 		iounmap(cmu);
 }
 
+/*
+ * Wait for a CLEAN frame on the link, then return right after its FRAMEEND
+ * (vertical blanking) so the caller can enable the WDMA channel before the
+ * next FRAMESTART. "Clean" = a frame during which INT_SRC0 reported no
+ * packet errors (ID/CRC/ECC/overflow) and INT_SRC1 no lost FS/FE.
+ *
+ * 2026-09-19 history: enabling the channel before the sensor ran captured
+ * 3 times and died 2 times (OTF OVERLAP + ABORTED from the first frame);
+ * enabling right after any FRAMEEND died once; enabling mid-frame after a
+ * FRAMESTART (pablo-style) left the channel active but never completing a
+ * frame (2/2). The link's INT_SRC0 shows ID/CRC/ECC/OVER errors and lost
+ * FS/FE at stream start, i.e. junk packets while the PHY settles; a DMA
+ * enabled while that junk flows takes a bogus frame start and aborts.
+ * Returns 0 in the blanking after a clean frame, -ETIMEDOUT otherwise.
+ */
+static int gs101_csis_wait_clean_frame(struct gs101_csis *csis)
+{
+	void __iomem *link = csis->link;
+	const struct is_reg *r0 = &csi_regs[CSIS_R_CSIS_INT_SRC0];
+	const struct is_reg *r1 = &csi_regs[CSIS_R_CSIS_INT_SRC1];
+	u32 fs = 1U << csi_fields[CSIS_F_FRAMESTART].bit_start;
+	u32 fe = 1U << csi_fields[CSIS_F_FRAMEEND].bit_start;
+	u32 lost = (1U << csi_fields[CSIS_F_ERR_LOST_FS].bit_start) |
+		   (1U << csi_fields[CSIS_F_ERR_LOST_FE].bit_start);
+	unsigned int i, frames = 0;
+	u32 s0, s1;
+
+	writel(~0U, link + r0->sfr_offset);		/* clear everything */
+	writel(~0U, link + r1->sfr_offset);
+	for (i = 0; i < 600; i++) {			/* <= 600 ms */
+		s1 = readl(link + r1->sfr_offset);
+		if (s1 & fe) {
+			s0 = readl(link + r0->sfr_offset);
+			frames++;
+			if (!(s0 & 0x00ffffff) && !(s1 & lost) && (s1 & fs)) {
+				writel(~0U, link + r0->sfr_offset);
+				writel(~0U, link + r1->sfr_offset);
+				dev_info(csis->dev, "clean frame after %u frame(s)\n", frames);
+				return 0;
+			}
+			/* dirty frame: clear and evaluate the next one */
+			writel(~0U, link + r0->sfr_offset);
+			writel(~0U, link + r1->sfr_offset);
+		}
+		usleep_range(1000, 1500);
+	}
+	return -ETIMEDOUT;
+}
+
 static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct gs101_csis *csis = vb2_get_drv_priv(q);
@@ -825,10 +1153,18 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto err_phy;
 	}
 
+	if (gs101_csis_dma_ctx >= 0 && gs101_csis_dma_ctx <= 3 &&
+	    csis->dma_ch != (unsigned int)gs101_csis_dma_ctx) {
+		dev_info(csis->dev, "dma_ctx override: context %u -> %d\n",
+			 csis->dma_ch, gs101_csis_dma_ctx);
+		csis->dma_ch = gs101_csis_dma_ctx;
+	}
 	gs101_csis_hw_start(csis, first->addr);
 	spin_lock_irqsave(&csis->buf_lock, flags);
 	csis->sequence = 0;
 	csis->dma_armed = true;
+	if (csis->dma_ch < 4)
+		gs101_csis_ctx_owner[csis->dma_ch] = csis;
 	spin_unlock_irqrestore(&csis->buf_lock, flags);
 	dev_info(csis->dev, "hw_start done, enabling sensor stream\n");
 
@@ -836,12 +1172,20 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret && ret != -ENOIOCTLCMD)
 		goto err_hw_stop;
 
+	/* Enable the WDMA channel in the blanking after a clean frame (see hw_start). */
+	ret = gs101_csis_wait_clean_frame(csis);
+	if (ret)
+		dev_warn(csis->dev, "no clean link frame within 600 ms, enabling WDMA anyway\n");
+	gs101_csis_hw_dma_enable(csis, true);
+
 	return 0;
 
 err_hw_stop:
 	spin_lock_irqsave(&csis->buf_lock, flags);
 	csis->dma_armed = false;
 	spin_unlock_irqrestore(&csis->buf_lock, flags);
+	if (csis->dma_ch < 4 && gs101_csis_ctx_owner[csis->dma_ch] == csis)
+		gs101_csis_ctx_owner[csis->dma_ch] = NULL;
 	gs101_csis_hw_stop(csis);
 err_phy:
 	if (csis->num_phys) {
@@ -865,6 +1209,8 @@ static void gs101_csis_stop_streaming(struct vb2_queue *q)
 	spin_lock_irqsave(&csis->buf_lock, flags);
 	csis->dma_armed = false;
 	spin_unlock_irqrestore(&csis->buf_lock, flags);
+	if (csis->dma_ch < 4 && gs101_csis_ctx_owner[csis->dma_ch] == csis)
+		gs101_csis_ctx_owner[csis->dma_ch] = NULL;
 	gs101_csis_hw_stop(csis);
 	if (csis->num_phys) {
 		phy_power_off(csis->phys[0]);
@@ -900,6 +1246,28 @@ static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 	pf->sizeimage = pf->bytesperline * pf->height;
 }
 
+/*
+ * libcamera (simple pipeline, IO_MC) enumerates frame sizes per pixel
+ * format / media bus code. The WDMA takes any size the sensor sends, so
+ * report a stepwise range rather than a list.
+ */
+static int gs101_csis_enum_framesizes(struct file *file, void *priv,
+				      struct v4l2_frmsizeenum *fsize)
+{
+	if (fsize->index)
+		return -EINVAL;
+	if (fsize->pixel_format != V4L2_PIX_FMT_SRGGB10)
+		return -EINVAL;
+	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+	fsize->stepwise.min_width = 16;
+	fsize->stepwise.max_width = 8192;
+	fsize->stepwise.step_width = 2;
+	fsize->stepwise.min_height = 16;
+	fsize->stepwise.max_height = 8192;
+	fsize->stepwise.step_height = 2;
+	return 0;
+}
+
 static int gs101_csis_querycap(struct file *file, void *priv,
 			       struct v4l2_capability *cap)
 {
@@ -912,6 +1280,15 @@ static int gs101_csis_enum_fmt(struct file *file, void *priv,
 			       struct v4l2_fmtdesc *f)
 {
 	if (f->index)
+		return -EINVAL;
+	/*
+	 * V4L2_CAP_IO_MC: libcamera's simple pipeline enumerates the video
+	 * node's formats filtered by the media bus code it set on the subdev
+	 * chain ("Media bus code filtering not supported" otherwise, 2026-09-19).
+	 * The WDMA writes whatever Bayer order the sensor sends, 10 bit in 16;
+	 * the only pixel format we expose is SRGGB10 (imx355/imx386 order).
+	 */
+	if (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SRGGB10_1X10)
 		return -EINVAL;
 	f->pixelformat = V4L2_PIX_FMT_SRGGB10;
 	return 0;
@@ -974,6 +1351,7 @@ static const struct v4l2_ioctl_ops gs101_csis_ioctl_ops = {
 	.vidioc_g_input			= gs101_csis_g_input,
 	.vidioc_s_input			= gs101_csis_s_input,
 	.vidioc_enum_fmt_vid_cap	= gs101_csis_enum_fmt,
+	.vidioc_enum_framesizes		= gs101_csis_enum_framesizes,
 	.vidioc_g_fmt_vid_cap		= gs101_csis_g_fmt,
 	.vidioc_try_fmt_vid_cap		= gs101_csis_try_fmt,
 	.vidioc_s_fmt_vid_cap		= gs101_csis_s_fmt,
@@ -1045,7 +1423,7 @@ static int gs101_csis_register_video(struct gs101_csis *csis)
 	vdev->queue = q;
 	vdev->v4l2_dev = &csis->v4l2_dev;
 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
-			    V4L2_CAP_READWRITE;
+			    V4L2_CAP_READWRITE | V4L2_CAP_IO_MC;
 	video_set_drvdata(vdev, csis);
 
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
@@ -1228,11 +1606,22 @@ static int gs101_csis_probe(struct platform_device *pdev)
 	if (!csis->dma)
 		return -ENOMEM;
 
+	/* csis-ebuf (shared like csis-dma, mapped non-exclusively); optional. */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "csis-ebuf");
+	if (res) {
+		csis->ebuf = devm_ioremap(dev, res->start, resource_size(res));
+		if (!csis->ebuf)
+			return -ENOMEM;
+	} else {
+		dev_warn(dev, "no csis-ebuf reg: EBUF bypass not programmed\n");
+	}
+
 	/* WDMA context for this instance (CSIS_DMA0/1); DT prop kept as -vc. */
 	of_property_read_u32(dev->of_node, "google,csis-dma-vc", &csis->dma_ch);
 	if (csis->dma_ch > 3)
 		return dev_err_probe(dev, -EINVAL, "invalid csis-dma-ch %u\n",
 				     csis->dma_ch);
+	csis->irq_ctx = csis->dma_ch;
 
 	/*
 	 * The csis-phy register bank (0x1A4F0000) belongs to the MIPI D/C-PHY
@@ -1249,6 +1638,18 @@ static int gs101_csis_probe(struct platform_device *pdev)
 		for (i = 0; i < csis->num_clks; i++)
 			if (csis->clks[i].id && !strcmp(csis->clks[i].id, "cam-dvfs"))
 				csis->cam_dvfs = csis->clks[i].clk;
+	}
+
+	/*
+	 * SYSREG_CSIS for the WDMA routing (see hw_start). Optional so the old
+	 * DT still probes, but without it no frame reaches the DMA.
+	 */
+	csis->sysreg = syscon_regmap_lookup_by_phandle(dev->of_node,
+						       "samsung,sysreg");
+	if (IS_ERR(csis->sysreg)) {
+		dev_warn(dev, "no samsung,sysreg syscon (%ld): WDMA routing not programmed\n",
+			 PTR_ERR(csis->sysreg));
+		csis->sysreg = NULL;
 	}
 
 	ret = gs101_csis_get_phys(csis);

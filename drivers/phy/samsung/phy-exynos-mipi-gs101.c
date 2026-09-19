@@ -986,6 +986,139 @@ static struct phy *exynos_mipi_phy_of_xlate(struct device *dev,
  * HS clock. The m0s4s4s4s4s4 combo PHY is a DCphy (major 0x0504); the minor
  * selects the lane configuration (4-lane = 0x0000, 2-lane = 0x0001).
  */
+/*
+ * Stock D-PHY bring-up, as the Tensor camera HAL (liblyric_hwl.so,
+ * csi_context.cc "CSI PHY configuration", routine @0xc83670) programs the
+ * m0s4s4s4s4s4 DCphy for a D-PHY sensor. Decoded 2026-09-18 and replayed
+ * from userspace on DCPHY4/link4 with the front IMX355 streaming: PHY_STATUS
+ * goes to 0x00 (clock + all data lanes in HS) and the link frame counter
+ * runs. The vendor phy_cfg_table presets below are dead code in the vendor
+ * tree and do NOT wake the receiver (see the #if 0 in configure()).
+ *
+ * T_HS_SETTLE comes from the HAL's table (camera-re/hal_dphy_settle_table.txt),
+ * indexed by the MIPI rate in Mbps rounded to 10 Mbps: 4500 -> 25 down to
+ * 90 -> 6 (above 4500: 25, below 90: 5). settle_clk_sel is set below
+ * 1500 Mbps and SD_ANA_CON2 gets a skew-delay code by rate band
+ * (1500-1999: 0x300, 2000-2999: 0x200, else 0).
+ */
+static const u8 gs101_dcphy_hal_settle[442] = {	/* [i] = rate 4500 - 10*i */
+	25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 24, 24, 24, 24, 24, 24,
+	24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 23, 23, 23, 23, 23, 23,
+	23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 22, 22, 22, 22, 22,
+	22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 22, 21, 21, 21, 21,
+	21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 20, 20, 20, 20,
+	20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 19, 19, 19,
+	19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 18, 18, 18,
+	18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 17, 17,
+	17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 16,
+	16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 15,
+	15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+	14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+	14, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+	13, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+	12, 12, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+	11, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+	10, 10, 10,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,  9,
+	 9,  9,  9,  9,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,
+	 8,  8,  8,  8,  7,  7,  7,  7,  7,  7,  7,  7,  7, 73, 73, 72,
+	72, 71, 71, 70, 70, 69, 69, 68, 68, 67, 67, 66, 66, 65, 65, 64,
+	64, 64, 63, 63, 62, 62, 61, 61, 60, 60, 59, 59, 58, 58, 57, 57,
+	56, 56, 55, 55, 54, 54, 53, 53, 52, 52, 52, 51, 51, 50, 50, 49,
+	49, 48, 48, 47, 47, 46, 46, 45, 45, 44, 44, 43, 43, 42, 42, 41,
+	41, 40, 40, 39, 39, 39, 38, 38, 37, 37, 36, 36, 35, 35, 34, 34,
+	33, 33, 32, 32, 31, 31, 30, 30, 29, 29, 28, 28, 27, 27, 27, 26,
+	26, 25, 25, 24, 24, 23, 23, 22, 22, 21, 21, 20, 20, 19, 19, 18,
+	18, 17, 17, 16, 16, 15, 15, 14, 14, 14, 13, 13, 12, 12, 11, 11,
+	10, 10,  9,  9,  8,  8,  7,  7,  6,  6,
+};
+
+static u32 gs101_dcphy_hal_settle_for(u32 rate_mbps)
+{
+	u32 key = roundup(rate_mbps, 10);
+
+	if (key > 4500)
+		return 25;
+	if (key < 90)
+		return 5;
+	return gs101_dcphy_hal_settle[(4500 - key) / 10];
+}
+
+static int gs101_dcphy_hal_dphy_set(void __iomem *regs, unsigned int lanes,
+				    u32 rate_mbps)
+{
+	void __iomem *bias;
+	u32 settle = gs101_dcphy_hal_settle_for(rate_mbps);
+	u32 settle_clk_sel = (rate_mbps < 1500) ? BIT(8) : 0;
+	u32 skew;
+	unsigned int i;
+
+	if (rate_mbps >= 1500 && rate_mbps < 2000)
+		skew = 0x300;
+	else if (rate_mbps >= 2000 && rate_mbps < 3000)
+		skew = 0x200;
+	else
+		skew = 0;
+
+	/* 1. disable the clock lane and every data lane (GNR_CON0 = 0) */
+	writel(0, regs + 0x0000);
+	for (i = 0; i < lanes; i++)
+		writel(0, regs + 0x0100 + i * 0x100);
+
+	/*
+	 * 2. shared master bias block (M_BIAS @0x1A4F1000; same three values as
+	 * the vendor presets, plus CON3 = 0 and CON4 = 0x200 for D-PHY). TODO:
+	 * take this from a DT reg instead of a fixed address.
+	 */
+	bias = ioremap(0x1A4F1000, 0x1000);
+	if (!bias)
+		return -ENOMEM;
+	writel(0x00000010, bias + 0x0000);	/* M_BIAS_CON0 */
+	writel(0x00000110, bias + 0x0004);	/* M_BIAS_CON1 */
+	writel(0x00003223, bias + 0x0008);	/* M_BIAS_CON2 */
+	writel(0x00000000, bias + 0x000c);	/* M_BIAS_CON3 */
+	writel(0x00000200, bias + 0x0010);	/* M_BIAS_CON4 */
+	iounmap(bias);
+
+	/* 3. clock lane */
+	writel(0x00001450, regs + 0x0004);	/* SC_GNR_CON1 */
+	writel(0x00000009, regs + 0x0008);	/* SC_ANA_CON0 */
+	writel(0x0000ea40, regs + 0x000c);	/* SC_ANA_CON1 */
+	writel(0x00000002, regs + 0x0010);	/* SC_ANA_CON2 */
+	writel(0x00008600, regs + 0x0014);	/* SC_ANA_CON3 */
+	writel(0x00004000, regs + 0x0018);	/* SC_ANA_CON4 */
+	writel(0x00000000, regs + 0x001c);	/* SC_ANA_CON5 */
+	writel(0x00000301, regs + 0x0030);	/* SC_TIME_CON0 */
+	writel(0x00000001, regs + 0x0040);	/* SC_DATA_CON0 */
+	writel(0x00000001, regs + 0x0000);	/* SC_GNR_CON0 = enable */
+
+	/* 4. data lanes */
+	for (i = 0; i < lanes; i++) {
+		void __iomem *sd = regs + 0x0100 + i * 0x100;
+		u32 val;
+
+		writel(0x00001450, sd + 0x0004);	/* SD_GNR_CON1 */
+		writel(0x00000009, sd + 0x0008);	/* SD_ANA_CON0 */
+		writel(0x0000ea40, sd + 0x000c);	/* SD_ANA_CON1 */
+		writel(0x00000002 | skew, sd + 0x0010);	/* SD_ANA_CON2 */
+		writel(0x00008600, sd + 0x0014);	/* SD_ANA_CON3 */
+		writel(0x00004000, sd + 0x0018);	/* SD_ANA_CON4 */
+		writel(0x00000000, sd + 0x001c);	/* SD_ANA_CON5 */
+		writel(0x00000000, sd + 0x0020);	/* SD_ANA_CON6 */
+		writel(0x00000040, sd + 0x0024);	/* SD_ANA_CON7 */
+		val = readl(sd + 0x0030) & ~0x1ffU;
+		writel(val | settle | settle_clk_sel, sd + 0x0030); /* SD_TIME_CON0 */
+		writel(0x00000003, sd + 0x0034);	/* SD_TIME_CON1 */
+		val = readl(sd + 0x0040);
+		writel(val | BIT(0), sd + 0x0040);	/* SD_DESKEW_CON0: skew_cal_en */
+		writel(0x0000081a, sd + 0x0050);	/* SD_DESKEW_CON4 */
+		writel(0x00000001, sd + 0x0000);	/* SD_GNR_CON0 = enable */
+	}
+
+	pr_info("%s: %u lanes, %u Mbps -> settle %u clk_sel %u skew 0x%x\n",
+		__func__, lanes, rate_mbps, settle, !!settle_clk_sel, skew);
+	return 0;
+}
+
 static int exynos_mipi_phy_configure(struct phy *phy,
 				     union phy_configure_opts *opts)
 {
@@ -1056,9 +1189,19 @@ static int exynos_mipi_phy_configure(struct phy *phy,
 	 * a freeze; the stack overrun was.)
 	 */
 	__set_phy_reset(state, phy_desc, 1);		/* release, as the HAL does */
-	writel(0x00000001, phy_desc->regs + 0x0000);	/* SC_GNR_CON0 = enable, as the HAL does */
+	/*
+	 * 2026-09-18 (after TEST f): the HAL does program the whole bank -- the
+	 * register-name-table claim above only covered its LWIS name lookups;
+	 * the analog/timing writes go by raw offset (routine @0xc83670). Do the
+	 * same; proven from userspace on the link the front sensor actually
+	 * lands on (DCPHY4/link4, see gs101-pixel-common.dtsi).
+	 */
+	ret = gs101_dcphy_hal_dphy_set(phy_desc->regs, lanes, speed_mbps);
+#if 0	/* TEST (f): gnr_con0 only -- gives an idle PHY (STOPSTATE), superseded */
+	writel(0x00000001, phy_desc->regs + 0x0000);	/* SC_GNR_CON0 = enable */
 	ret = 0;
-#if 0	/* vendor 0504 preset: NOT run on stock, see TEST (f) above */
+#endif
+#if 0	/* vendor 0504 preset: NOT run on stock, dead code in the vendor tree */
 	ret = cfg->set(phy_desc->regs, 0, info);
 #endif
 

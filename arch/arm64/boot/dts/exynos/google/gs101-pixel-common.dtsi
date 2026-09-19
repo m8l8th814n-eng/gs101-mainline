@@ -192,27 +192,36 @@
 		#phy-cells = <1>;
 	};
 
+	/*
+	 * dcphy4 is where the front IMX355 physically lands (proven 2026-09-18
+	 * by probing every bank with the sensor streaming: only this one sees
+	 * the HS clock). As a 4-lane receiver it uses the clock lane at 0x2B00
+	 * and data lanes 0x2C00..0x2F00, i.e. the vendor DT's "csi4" (0x2B00,
+	 * 0x300) plus "csi5" (0x2E00, 0x300) -- so the bank is 0x500 here and
+	 * the separate csi5 node below is commented out (it would overlap).
+	 */
 	mipi_phy_csis4: dcphy@1a4f2b00 {
 		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
 		samsung,pmu-syscon = <&pmu_system_controller>;
 		isolation = <0x3ebc>;
 		samsung,reset-sysreg = <&sysreg_csis_reset>;
 		reset = <4>;
-		reg = <0x0 0x1A4F2B00 0x300>;
+		reg = <0x0 0x1A4F2B00 0x500>;	/* was 0x300 (vendor csi4 only) */
 		owner = <1>;
 		#phy-cells = <1>;
 	};
 
-	mipi_phy_csis5: dcphy@1a4f2e00 {
-		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
-		samsung,pmu-syscon = <&pmu_system_controller>;
-		isolation = <0x3ebc>;
-		samsung,reset-sysreg = <&sysreg_csis_reset>;
-		reset = <5>;
-		reg = <0x0 0x1A4F2E00 0x300>;
-		owner = <1>;
-		#phy-cells = <1>;
-	};
+/*	mipi_phy_csis5: dcphy@1a4f2e00 {	-- overlaps dcphy4's data lanes, see above
+ *		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
+ *		samsung,pmu-syscon = <&pmu_system_controller>;
+ *		isolation = <0x3ebc>;
+ *		samsung,reset-sysreg = <&sysreg_csis_reset>;
+ *		reset = <5>;
+ *		reg = <0x0 0x1A4F2E00 0x300>;
+ *		owner = <1>;
+ *		#phy-cells = <1>;
+ *	};
+ */
 
 	mipi_phy_csis6: dcphy@1a4f3300 {
 		compatible = "samsung,mipi-phy-m0s4s4s4s4s4";
@@ -245,21 +254,25 @@
 	 * gs101-isp.dtsi (lwis_csi); the dcphys above are reached through the
 	 * generic PHY framework, so the csis-phy bank is not mapped here.
 	 *
-	 * csis0: front camera IMX355 (4-lane) on link0 / dcphy0 / WDMA vc0.
+	 * csis0: front camera IMX355 (4-lane) on link4 / dcphy4 / WDMA vc0.
+	 * (Was link0 / dcphy0 until 2026-09-18 -- an unverified assumption;
+	 * the sensor is wired to DCPHY4, see the dcphy4 node above.)
 	 */
-	gs101_csis0: mipi-csis@1a440000 {
+	gs101_csis0: mipi-csis@1a480000 {
 		compatible = "google,gs101-mipi-csis";
-		reg = <0x0 0x1A440000 0x1000>,   /* csis-link0 */
-		      <0x0 0x1A4D0000 0x10000>;  /* csis-dma (WDMA, shared) */
-		reg-names = "csis-link0", "csis-dma";
+		reg = <0x0 0x1A480000 0x1000>,   /* csis-link4 (was 0x1A440000 link0) */
+		      <0x0 0x1A4D0000 0x10000>,  /* csis-dma (WDMA, shared) */
+		      <0x0 0x1A4C0000 0x100>;    /* csis-ebuf (elastic buffer, shared) */
+		reg-names = "csis-link4", "csis-dma", "csis-ebuf";
 		/*
 		 * reg[0] = link bank; IRQs are the WDMA frame-done for this vc
-		 * (IRQ_CSIS_DMA0_CSIS = SPI 302) + the link IRQ (IRQ_CSIS0_CSIS
-		 * = SPI 294), per vendor dt-bindings/.../gs101.h.
+		 * (IRQ_CSIS_DMA0_CSIS = SPI 302) + the link IRQ (IRQ_CSIS4_CSIS
+		 * = SPI 298; link0 was IRQ_CSIS0_CSIS = SPI 294), per vendor
+		 * dt-bindings/.../gs101.h.
 		 */
 		interrupts = <GIC_SPI 302 IRQ_TYPE_LEVEL_HIGH 0>,
-			     <GIC_SPI 294 IRQ_TYPE_LEVEL_HIGH 0>;
-		interrupt-names = "csis-dma0", "csis-link0";
+			     <GIC_SPI 298 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupt-names = "csis-dma0", "csis-link4";
 		/*
 		 * CMU_CSIS leaf gates for this link + its WDMA context, from the
 		 * generated cmu_csis block: APB bridge, CSIS core, WDMA, elastic
@@ -272,11 +285,18 @@
 			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_EBUF>,
 			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA0_ACLK>,
 			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA0_PCLK>,
-			 <&cmu_csis CLK_GOUT_CSIS_MIPI_PHY_LINK_WRAP_ACLK_CSIS0>,
+			 <&cmu_csis CLK_GOUT_CSIS_MIPI_PHY_LINK_WRAP_ACLK_CSIS4>, /* was _CSIS0 */
 			 <&acpm_ipc GS101_CLK_ACPM_DVFS_CAM>;
 		clock-names = "apb", "c2", "dma", "ebuf", "qe-aclk", "qe-pclk",
 			      "phy-wrap", "cam-dvfs";
-		phys = <&mipi_phy_csis0 0>;
+		phys = <&mipi_phy_csis4 0>;	/* was <&mipi_phy_csis0 0> */
+		/*
+		 * SYSREG_CSIS: the WDMA input routing (stock HAL csi_context.cc:
+		 * 0x430 + slot*4 = link, 0x408 + ctx*4 = slot, 0x488 enable bit
+		 * link + ctx*8) and the per-PHY reset bits live here, not in the
+		 * DMA context bank.
+		 */
+		samsung,sysreg = <&sysreg_csis>;
 		memory-region = <&camera_cma>;
 		google,csis-dma-vc = <0>;
 
@@ -296,22 +316,25 @@
 	};
 
 	/*
-	 * csis2: rear ultra-wide IMX386 (2-lane) on link2 / dcphy2 / WDMA vc1.
-	 * link2 is a 2-lane-capable PHY (dcphy2), matching the sensor. The
-	 * exact link/PHY index is the vendor's physical routing; adjust here if
-	 * the sensor never reaches FRAME_START on this link.
+	 * csis2: rear ultra-wide IMX386 (2-lane) on link1 / dcphy1 / WDMA vc1.
+	 * Proven 2026-09-18 by probing every DCPHY bank with the sensor
+	 * streaming: only dcphy1 (clock 0x1B00, data 0x1C00/0x1D00; the upper
+	 * two lanes of that 4-lane bank stay idle) sees it. Was link2 / dcphy2
+	 * (a 2-lane bank, chosen by assumption) until then. The node label
+	 * stays gs101_csis2 so nothing else has to change.
 	 */
-	gs101_csis2: mipi-csis@1a460000 {
+	gs101_csis2: mipi-csis@1a450000 {
 		compatible = "google,gs101-mipi-csis";
-		reg = <0x0 0x1A460000 0x1000>,   /* csis-link2 */
-		      <0x0 0x1A4D0000 0x10000>;  /* csis-dma (WDMA, shared) */
-		reg-names = "csis-link2", "csis-dma";
-		/* WDMA vc1 frame-done (IRQ_CSIS_DMA1_CSIS = SPI 303) + link2
-		 * IRQ (IRQ_CSIS2_CSIS = SPI 296).
+		reg = <0x0 0x1A450000 0x1000>,   /* csis-link1 (was 0x1A460000 link2) */
+		      <0x0 0x1A4D0000 0x10000>,  /* csis-dma (WDMA, shared) */
+		      <0x0 0x1A4C0000 0x100>;    /* csis-ebuf (elastic buffer, shared) */
+		reg-names = "csis-link1", "csis-dma", "csis-ebuf";
+		/* WDMA vc1 frame-done (IRQ_CSIS_DMA1_CSIS = SPI 303) + link1
+		 * IRQ (IRQ_CSIS1_CSIS = SPI 295; link2 was IRQ_CSIS2_CSIS = 296).
 		 */
 		interrupts = <GIC_SPI 303 IRQ_TYPE_LEVEL_HIGH 0>,
-			     <GIC_SPI 296 IRQ_TYPE_LEVEL_HIGH 0>;
-		interrupt-names = "csis-dma1", "csis-link2";
+			     <GIC_SPI 295 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupt-names = "csis-dma1", "csis-link1";
 		/*
 		 * CMU_CSIS leaf gates for this link + its WDMA context, from the
 		 * generated cmu_csis block: APB bridge, CSIS core, WDMA, elastic
@@ -324,11 +347,12 @@
 			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_EBUF>,
 			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA1_ACLK>,
 			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA1_PCLK>,
-			 <&cmu_csis CLK_GOUT_CSIS_MIPI_PHY_LINK_WRAP_ACLK_CSIS2>,
+			 <&cmu_csis CLK_GOUT_CSIS_MIPI_PHY_LINK_WRAP_ACLK_CSIS1>, /* was _CSIS2 */
 			 <&acpm_ipc GS101_CLK_ACPM_DVFS_CAM>;
 		clock-names = "apb", "c2", "dma", "ebuf", "qe-aclk", "qe-pclk",
 			      "phy-wrap", "cam-dvfs";
-		phys = <&mipi_phy_csis2 0>;
+		phys = <&mipi_phy_csis1 0>;	/* was <&mipi_phy_csis2 0> */
+		samsung,sysreg = <&sysreg_csis>;	/* WDMA routing + PHY reset, see csis0 */
 		memory-region = <&camera_cma>;
 		google,csis-dma-vc = <1>;
 
