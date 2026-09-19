@@ -78,7 +78,7 @@
 #define IMX386_LINK_FREQ_INDEX		0
 
 /* number of data lanes */
-#define IMX386_DATA_LANES		2
+#define IMX386_DATA_LANES		4	/* 2026-09-19: was 2; the rear sits on a 4-lane DCPHY bank and streams on all four */
 
 struct imx386_reg {
 	u16 address;
@@ -336,7 +336,7 @@ static const struct imx386_reg mode_1920x1080_regs[] = {
 	{ 0x034d, 0x80 },
 	{ 0x034e, 0x04 },
 	{ 0x034f, 0x38 },
-	{ 0x0114, 0x01 },
+	{ 0x0114, 0x03 },	/* CSI lane mode: 4 lanes (was 0x01 = 2) */
 	{ 0x0408, 0x00 },
 	{ 0x0409, 0x00 },
 	{ 0x040a, 0x00 },

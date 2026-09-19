@@ -114,7 +114,14 @@ MODULE_PARM_DESC(ebuf_bypass, "bypass the CSIS elastic buffer (default 1; 0 = pr
  * QUAD for the OTF path while we use SINGLE. Both only take effect before
  * the first frame, so they are runtime parameters rather than rebuilds.
  */
-static unsigned int gs101_csis_dma_fmt = 6;
+/*
+ * 2026-09-19 sweep of the FMT register on this WDMA (front, QUAD):
+ * "unpack" values (6, 0x0a, 0x0e, 0x02) write only 2 pixels per 8-byte
+ * beat; 0x1e/0x05/0x16/0x1a write 4 px in 5 bytes + 3 pad; 0x04 (and 0x07,
+ * 0x1c) write densely. 0x04 decodes as MIPI RAW10 (V4L2 SRGGB10P: 4 pixels
+ * in 5 bytes, LSB byte last), which is what we expose.
+ */
+static unsigned int gs101_csis_dma_fmt = 0x04;
 module_param_named(dma_fmt, gs101_csis_dma_fmt, uint, 0644);
 MODULE_PARM_DESC(dma_fmt, "raw value for the WDMA channel FMT register (default 6)");
 
@@ -167,6 +174,26 @@ struct gs101_csis {
 	struct clk		*cam_dvfs;
 	/* SYSREG_CSIS syscon ("samsung,sysreg"): WDMA input routing. */
 	struct regmap		*sysreg;
+	/*
+	 * Per-instance WDMA FMT override from DT ("google,wdma-fmt"), 0 = use
+	 * the dma_fmt module parameter. 2026-09-19: the dense SRGGB10P value
+	 * (0x04) never completes a 1920-px line on the rear IMX386 link (any
+	 * lane count, pixel mode, input path or width tried) while the stock
+	 * HAL's 0x1e (4 px in 5 bytes + 3 pad per 8) does; the front is fine
+	 * with 0x04. The rear's buffers therefore carry the 0x1e layout, not
+	 * true SRGGB10P, until that layout gets its own pixel format.
+	 */
+	u32			wdma_fmt;
+	/*
+	 * Scratch frame the WDMA writes into while userspace has no buffer
+	 * queued. The channel is never disabled mid-stream: disabling it and
+	 * re-enabling from buf_queue lands mid-frame -> OTF OVERLAP -> the
+	 * channel aborts for good (seen with libcamera 2026-09-19, "rear
+	 * freezes after flickering"). Addresses are switched at FRAME_END only.
+	 */
+	void			*scratch;
+	dma_addr_t		scratch_addr;
+	size_t			scratch_size;
 	struct phy		*phys[GS101_CSIS_NUM_PHYS];
 	int			num_phys;
 
@@ -499,7 +526,10 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 			gs101_csis_dma_input_prl ? 1 : 0);
 
 	/* WDMA VC0: 2D, RAW10 unpacked to 16-bit, resolution, stride. */
-	if (gs101_csis_dma_fmt != 6) {
+	if (csis->wdma_fmt) {
+		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT],
+			      csis->wdma_fmt);
+	} else if (gs101_csis_dma_fmt != 6) {	/* default 0x04 = SRGGB10P, see the parameter */
 		/* raw override, see the dma_fmt parameter */
 		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT],
 			      gs101_csis_dma_fmt);
@@ -673,10 +703,14 @@ static irqreturn_t gs101_csis_irq(int irq, void *data)
 			list_del(&next->list);
 			gs101_csis_hw_set_dma_addr(csis, next->addr);
 		} else {
-			/* Underrun: stop writing until buf_queue re-arms us. */
-			gs101_csis_hw_dma_enable(csis, false);
+			/* Underrun: keep the channel running into the scratch frame. */
+			gs101_csis_hw_set_dma_addr(csis, csis->scratch_addr);
 		}
 		csis->cur_buf = next;
+#if 0	/* disabling here + re-enabling from buf_queue aborts the channel (2026-09-19) */
+		if (!next)
+			gs101_csis_hw_dma_enable(csis, false);
+#endif
 		spin_unlock(&csis->buf_lock);
 
 		if (done) {
@@ -735,14 +769,20 @@ static void gs101_csis_buf_queue(struct vb2_buffer *vb)
 	buf->addr = vb2_dma_contig_plane_dma_addr(vb, 0);
 
 	spin_lock_irqsave(&csis->buf_lock, flags);
+	/*
+	 * Always queue: while streaming the channel writes the scratch frame
+	 * during an underrun and the FRAME_END handler picks this buffer up at
+	 * the next frame boundary. (Before start_streaming, cur_buf/dma_armed
+	 * are not set and hw_start takes the first queued buffer.)
+	 */
+	list_add_tail(&buf->list, &csis->buf_list);
+#if 0	/* mid-frame re-arm: aborts the channel (2026-09-19) */
 	if (csis->dma_armed && !csis->cur_buf) {
-		/* Recover from underrun: this buffer becomes the DMA target. */
 		csis->cur_buf = buf;
 		gs101_csis_hw_set_dma_addr(csis, buf->addr);
 		gs101_csis_hw_dma_enable(csis, true);
-	} else {
-		list_add_tail(&buf->list, &csis->buf_list);
 	}
+#endif
 	spin_unlock_irqrestore(&csis->buf_lock, flags);
 }
 
@@ -1153,6 +1193,14 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto err_phy;
 	}
 
+	csis->scratch_size = csis->pixfmt.sizeimage;
+	csis->scratch = dma_alloc_coherent(csis->dev, csis->scratch_size,
+					   &csis->scratch_addr, GFP_KERNEL);
+	if (!csis->scratch) {
+		ret = -ENOMEM;
+		goto err_phy;
+	}
+
 	if (gs101_csis_dma_ctx >= 0 && gs101_csis_dma_ctx <= 3 &&
 	    csis->dma_ch != (unsigned int)gs101_csis_dma_ctx) {
 		dev_info(csis->dev, "dma_ctx override: context %u -> %d\n",
@@ -1188,6 +1236,11 @@ err_hw_stop:
 		gs101_csis_ctx_owner[csis->dma_ch] = NULL;
 	gs101_csis_hw_stop(csis);
 err_phy:
+	if (csis->scratch) {
+		dma_free_coherent(csis->dev, csis->scratch_size, csis->scratch,
+				  csis->scratch_addr);
+		csis->scratch = NULL;
+	}
 	if (csis->num_phys) {
 		phy_power_off(csis->phys[0]);
 		phy_exit(csis->phys[0]);
@@ -1219,6 +1272,11 @@ static void gs101_csis_stop_streaming(struct vb2_queue *q)
 	video_device_pipeline_stop(&csis->vdev);
 	gs101_csis_return_buffers(csis, VB2_BUF_STATE_ERROR);
 	csis->cur_buf = NULL;
+	if (csis->scratch) {
+		dma_free_coherent(csis->dev, csis->scratch_size, csis->scratch,
+				  csis->scratch_addr);
+		csis->scratch = NULL;
+	}
 }
 
 static const struct vb2_ops gs101_csis_vb2_ops = {
@@ -1231,18 +1289,87 @@ static const struct vb2_ops gs101_csis_vb2_ops = {
 
 /* ---------------- v4l2 ioctl ops ---------------- */
 
+/*
+ * The size the link is configured for (its sink pad = what the sensor sends).
+ * The WDMA only completes frames whose HRESOL/VRESOL match the incoming
+ * frame exactly (2026-09-19: 1920x1080 or 2048-wide requests against a
+ * 3280x2464 sensor never produced a frame end), so the video node can only
+ * offer that one size.
+ */
+static void gs101_csis_link_size(struct gs101_csis *csis, u32 *w, u32 *h)
+{
+	struct v4l2_subdev_state *state;
+	struct v4l2_mbus_framefmt *fmt;
+
+	*w = 0;
+	*h = 0;
+	state = v4l2_subdev_lock_and_get_active_state(&csis->sd);
+	if (!state)			/* before v4l2_subdev_init_finalize() */
+		return;
+	fmt = v4l2_subdev_state_get_format(state, GS101_CSIS_PAD_SINK);
+	*w = fmt->width;
+	*h = fmt->height;
+	v4l2_subdev_unlock_state(state);
+}
+
+/* Video-node S_FMT drives the link size (v4l2-ctl use without media-ctl). */
+static void gs101_csis_set_link_size(struct gs101_csis *csis, u32 w, u32 h)
+{
+	struct v4l2_subdev_state *state;
+	struct v4l2_mbus_framefmt *fmt;
+
+	state = v4l2_subdev_lock_and_get_active_state(&csis->sd);
+	if (!state)
+		return;
+	fmt = v4l2_subdev_state_get_format(state, GS101_CSIS_PAD_SINK);
+	fmt->width = w;
+	fmt->height = h;
+	*v4l2_subdev_state_get_format(state, GS101_CSIS_PAD_SOURCE) = *fmt;
+	v4l2_subdev_unlock_state(state);
+}
+
 static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 				  struct v4l2_pix_format *pf)
 {
-	pf->pixelformat = V4L2_PIX_FMT_SRGGB10;
+	u32 w, h;
+
+	pf->pixelformat = V4L2_PIX_FMT_SRGGB10P;
 	pf->field = V4L2_FIELD_NONE;
 	pf->colorspace = V4L2_COLORSPACE_RAW;
+	/*
+	 * A requested size is taken as-is and (in S_FMT) pushed into the link;
+	 * an unset size falls back to the link's current size. libcamera sets
+	 * the subdev chain first and then asks for what ENUM_FRAMESIZES lists.
+	 */
+	gs101_csis_link_size(csis, &w, &h);
 	if (!pf->width)
-		pf->width = GS101_CSIS_DEF_WIDTH;
+		pf->width = w ? w : GS101_CSIS_DEF_WIDTH;
 	if (!pf->height)
-		pf->height = GS101_CSIS_DEF_HEIGHT;
-	/* RAW10 packed as 16-bit per pixel for the WDMA output. */
-	pf->bytesperline = pf->width * 2;
+		pf->height = h ? h : GS101_CSIS_DEF_HEIGHT;
+	/* (was: RAW10 unpacked to 16 bit -- this WDMA writes 2 px per 8 bytes in that mode) */
+	/*
+	 * MIPI-packed RAW10 (4 px in 5 bytes) with a padded stride of 2 bytes
+	 * per pixel: the packed line is width*5/4 bytes, but with the stride at
+	 * ALIGN(width*5/4, 16) = 4112 (pablo's alignment) this WDMA corrupted
+	 * the tail of every 5-byte group, and with 2400 (rear) never finished a
+	 * frame, while width*2 (6560 / 3840, 32-byte multiples) captured clean
+	 * frames in every test (2026-09-19). Keep the proven stride; V4L2 users
+	 * read bytesperline and skip the padding.
+	 */
+	/*
+	 * 2026-09-19 evening: libcamera's software ISP asks for a GPU-friendly
+	 * stride (4352 for 3280 px = 256-byte multiple) and its EGL import of
+	 * our buffer fails with "WSI pitch not properly aligned" when we hand
+	 * back width*2 (6560) -> plasma-camera segfaults. Honour a requested
+	 * stride that covers the packed line and is a 64-byte multiple; keep
+	 * width*2 otherwise. (This instance's 0x1e layout, if set, needs
+	 * exactly width*2: 4 px per 8 bytes.)
+	 */
+	if (!csis->wdma_fmt && pf->bytesperline >= pf->width * 5 / 4 &&
+	    !(pf->bytesperline % 64))
+		;	/* keep the caller's stride */
+	else
+		pf->bytesperline = pf->width * 2;
 	pf->sizeimage = pf->bytesperline * pf->height;
 }
 
@@ -1256,8 +1383,13 @@ static int gs101_csis_enum_framesizes(struct file *file, void *priv,
 {
 	if (fsize->index)
 		return -EINVAL;
-	if (fsize->pixel_format != V4L2_PIX_FMT_SRGGB10)
+	if (fsize->pixel_format != V4L2_PIX_FMT_SRGGB10P)
 		return -EINVAL;
+	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+	gs101_csis_link_size(video_drvdata(file), &fsize->discrete.width,
+			     &fsize->discrete.height);
+	return 0;
+#if 0	/* a free STEPWISE range made libcamera pick 820x616 -> no frame ever (2026-09-19) */
 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fsize->stepwise.min_width = 16;
 	fsize->stepwise.max_width = 8192;
@@ -1266,6 +1398,7 @@ static int gs101_csis_enum_framesizes(struct file *file, void *priv,
 	fsize->stepwise.max_height = 8192;
 	fsize->stepwise.step_height = 2;
 	return 0;
+#endif
 }
 
 static int gs101_csis_querycap(struct file *file, void *priv,
@@ -1286,11 +1419,11 @@ static int gs101_csis_enum_fmt(struct file *file, void *priv,
 	 * node's formats filtered by the media bus code it set on the subdev
 	 * chain ("Media bus code filtering not supported" otherwise, 2026-09-19).
 	 * The WDMA writes whatever Bayer order the sensor sends, 10 bit in 16;
-	 * the only pixel format we expose is SRGGB10 (imx355/imx386 order).
+	 * the only pixel format we expose is SRGGB10P (imx355/imx386 order).
 	 */
 	if (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SRGGB10_1X10)
 		return -EINVAL;
-	f->pixelformat = V4L2_PIX_FMT_SRGGB10;
+	f->pixelformat = V4L2_PIX_FMT_SRGGB10P;
 	return 0;
 }
 
@@ -1320,6 +1453,7 @@ static int gs101_csis_s_fmt(struct file *file, void *priv,
 
 	gs101_csis_set_pixfmt(csis, &f->fmt.pix);
 	csis->pixfmt = f->fmt.pix;
+	gs101_csis_set_link_size(csis, f->fmt.pix.width, f->fmt.pix.height);
 	return 0;
 }
 
@@ -1622,6 +1756,7 @@ static int gs101_csis_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL, "invalid csis-dma-ch %u\n",
 				     csis->dma_ch);
 	csis->irq_ctx = csis->dma_ch;
+	of_property_read_u32(dev->of_node, "google,wdma-fmt", &csis->wdma_fmt);
 
 	/*
 	 * The csis-phy register bank (0x1A4F0000) belongs to the MIPI D/C-PHY

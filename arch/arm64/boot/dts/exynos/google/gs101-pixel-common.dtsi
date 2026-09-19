@@ -316,7 +316,7 @@
 	};
 
 	/*
-	 * csis2: rear ultra-wide IMX386 (2-lane) on link1 / dcphy1 / WDMA vc1.
+	 * csis2: rear ultra-wide IMX386 (4-lane) on link1 / dcphy1 / WDMA vc1.
 	 * Proven 2026-09-18 by probing every DCPHY bank with the sensor
 	 * streaming: only dcphy1 (clock 0x1B00, data 0x1C00/0x1D00; the upper
 	 * two lanes of that 4-lane bank stay idle) sees it. Was link2 / dcphy2
@@ -355,6 +355,12 @@
 		samsung,sysreg = <&sysreg_csis>;	/* WDMA routing + PHY reset, see csis0 */
 		memory-region = <&camera_cma>;
 		google,csis-dma-vc = <1>;
+		/*
+		 * WDMA FMT 0x1e (stock HAL value: 4 px in 5 bytes + 3 pad per 8):
+		 * the dense SRGGB10P value never completes a 1920-px line on this
+		 * link (2026-09-19). See the driver's wdma_fmt.
+		 */
+		google,wdma-fmt = <0x1e>;
 
 		ports {
 			#address-cells = <1>;
@@ -365,7 +371,7 @@
 				reg = <0>;
 				csis2_sink: endpoint {
 					remote-endpoint = <&imx386_ep>;
-					data-lanes = <1 2>;
+					data-lanes = <1 2 3 4>;	/* see imx386_ep */
 				};
 			};
 		};
@@ -1889,6 +1895,8 @@
 
 	imx355: camera-sensor@1a {
 		compatible = "sony,imx355";
+		/* Front camera: libcamera Location/Transform (was missing -> "Failed to retrieve the camera location"). */
+		orientation = <0>;
 		reg = <0x1a>;
 
 		/*
@@ -1969,6 +1977,8 @@
 
 	imx386: camera-sensor@1a {
 		compatible = "sony,imx386";
+		/* Rear ultra-wide: libcamera Location = back. */
+		orientation = <1>;
 		reg = <0x1a>;
 
 		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
@@ -1991,7 +2001,7 @@
 		port {
 			imx386_ep: endpoint {
 				remote-endpoint = <&csis2_sink>;
-				data-lanes = <1 2>;
+				data-lanes = <1 2 3 4>;	/* was <1 2>; dcphy1 is a 4-lane bank and the module drives all four */
 				link-frequencies = /bits/ 64 <360000000>;
 			};
 		};
