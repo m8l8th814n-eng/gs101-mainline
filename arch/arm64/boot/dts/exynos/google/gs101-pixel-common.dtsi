@@ -316,7 +316,7 @@
 	};
 
 	/*
-	 * csis2: rear ultra-wide IMX386 (4-lane) on link1 / dcphy1 / WDMA vc1.
+	 * csis2: rear ultra-wide IMX386 (2-lane, on a 4-lane bank) on link1 / dcphy1 / WDMA vc1.
 	 * Proven 2026-09-18 by probing every DCPHY bank with the sensor
 	 * streaming: only dcphy1 (clock 0x1B00, data 0x1C00/0x1D00; the upper
 	 * two lanes of that 4-lane bank stay idle) sees it. Was link2 / dcphy2
@@ -371,7 +371,7 @@
 				reg = <0>;
 				csis2_sink: endpoint {
 					remote-endpoint = <&imx386_ep>;
-					data-lanes = <1 2 3 4>;	/* see imx386_ep */
+					data-lanes = <1 2>;	/* see imx386_ep */
 				};
 			};
 		};
@@ -1897,6 +1897,7 @@
 		compatible = "sony,imx355";
 		/* Front camera: libcamera Location/Transform (was missing -> "Failed to retrieve the camera location"). */
 		orientation = <0>;
+		rotation = <270>;	/* sensor mounted rotated 270 deg (user-observed 2026-09-20) */
 		reg = <0x1a>;
 
 		/*
@@ -2001,7 +2002,7 @@
 		port {
 			imx386_ep: endpoint {
 				remote-endpoint = <&csis2_sink>;
-				data-lanes = <1 2 3 4>;	/* was <1 2>; dcphy1 is a 4-lane bank and the module drives all four */
+				data-lanes = <1 2>;	/* imx386 is 2-lane; 4 corrupts the frame (2026-09-19) */
 				link-frequencies = /bits/ 64 <360000000>;
 			};
 		};

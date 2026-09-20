@@ -158,6 +158,15 @@ static int gs101_csis_sysreg_slot;	/* 2026-09-19: slot 1 routed nothing, slot 0 
 module_param_named(sysreg_slot, gs101_csis_sysreg_slot, int, 0644);
 MODULE_PARM_DESC(sysreg_slot, "SYSREG_CSIS routing slot (default 0; -1 = WDMA context number)");
 
+/*
+ * Runtime override of the DT google,wdma-fmt: -1 = use DT, 0 = ignore it and
+ * use dma_fmt, else a raw FMT value. Lets the rear be tried on the front's
+ * SRGGB10P (0x04) path without a rebuild.
+ */
+static int gs101_csis_wdma_fmt = -1;
+module_param_named(wdma_fmt, gs101_csis_wdma_fmt, int, 0644);
+MODULE_PARM_DESC(wdma_fmt, "override DT google,wdma-fmt (-1 = DT, 0 = use dma_fmt, else raw)");
+
 /* WDMA DATA_CTRL input path for channel 0: 0 = OTF (pablo default), 1 = PRL. */
 static bool gs101_csis_dma_input_prl;
 module_param_named(dma_input_prl, gs101_csis_dma_input_prl, bool, 0644);
@@ -526,9 +535,9 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 			gs101_csis_dma_input_prl ? 1 : 0);
 
 	/* WDMA VC0: 2D, RAW10 unpacked to 16-bit, resolution, stride. */
-	if (csis->wdma_fmt) {
-		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT],
-			      csis->wdma_fmt);
+	val = gs101_csis_wdma_fmt >= 0 ? (u32)gs101_csis_wdma_fmt : csis->wdma_fmt;
+	if (val) {
+		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT], val);
 	} else if (gs101_csis_dma_fmt != 6) {	/* default 0x04 = SRGGB10P, see the parameter */
 		/* raw override, see the dma_fmt parameter */
 		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT],
