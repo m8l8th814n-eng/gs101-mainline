@@ -949,6 +949,12 @@ static const s64 link_freq_menu_items[] = {
 
 /* Mode configs */
 static const struct imx355_mode supported_modes[] = {
+#if 0	/*
+	 * 2026-09-20: these seven modes run with binning off (0x0901 = 0x11)
+	 * and emit raw Quad Bayer, which libcamera's software ISP cannot
+	 * demosaic. Only the 2x2-binned modes stay, so [0] and the largest
+	 * size are 1640x1232. Re-enable when a Quad-aware ISP path exists.
+	 */
 	{
 		.width = 3280,
 		.height = 2464,
@@ -1033,6 +1039,7 @@ static const struct imx355_mode supported_modes[] = {
 			.regs = mode_1920x1080_regs,
 		},
 	},
+#endif
 	{
 		.width = 1640,
 		.height = 1232,
@@ -1105,6 +1112,7 @@ static const struct imx355_mode supported_modes[] = {
 			.regs = mode_1280x720_regs,
 		},
 	},
+#if 0	/* 2026-09-20: 4x4 binning; the WDMA never completed a frame at this size (2026-09-19). */
 	{
 		.width = 820,
 		.height = 616,
@@ -1117,6 +1125,7 @@ static const struct imx355_mode supported_modes[] = {
 			.regs = mode_820x616_regs,
 		},
 	},
+#endif
 };
 
 static inline struct imx355 *to_imx355(struct v4l2_subdev *_sd)
@@ -1132,6 +1141,13 @@ static u32 imx355_get_format_code(struct imx355 *imx355)
 	 * It depends on the flip settings.
 	 */
 	u32 code;
+	/*
+	 * Native RGGB (2026-09-20). IMX355 is a standard RGB Bayer sensor per
+	 * Sony's datasheet (not RYYB). The colour order is RGGB; the maze on
+	 * bright highlights is a Quad Bayer effect handled on the capture side
+	 * via the 2x2 binning mode (on-chip quad to Bayer), not by cycling the
+	 * CFA phase. Flips: hflip -> GRBG, vflip -> GBRG, both -> BGGR.
+	 */
 	static const u32 codes[2][2] = {
 		{ MEDIA_BUS_FMT_SRGGB10_1X10, MEDIA_BUS_FMT_SGRBG10_1X10, },
 		{ MEDIA_BUS_FMT_SGBRG10_1X10, MEDIA_BUS_FMT_SBGGR10_1X10, },

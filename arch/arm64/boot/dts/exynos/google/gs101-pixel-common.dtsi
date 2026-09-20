@@ -290,6 +290,9 @@
 		clock-names = "apb", "c2", "dma", "ebuf", "qe-aclk", "qe-pclk",
 			      "phy-wrap", "cam-dvfs";
 		phys = <&mipi_phy_csis4 0>;	/* was <&mipi_phy_csis0 0> */
+		/* imx355 1640x1232 = 2x2 binning mode (0x0900=1, 0x0901=0x22) */
+		google,def-width = <1640>;
+		google,def-height = <1232>;
 		/*
 		 * SYSREG_CSIS: the WDMA input routing (stock HAL csi_context.cc:
 		 * 0x430 + slot*4 = link, 0x408 + ctx*4 = slot, 0x488 enable bit
@@ -1980,6 +1983,7 @@
 		compatible = "sony,imx386";
 		/* Rear ultra-wide: libcamera Location = back. */
 		orientation = <1>;
+		rotation = <90>;	/* user-observed after the 0x1e repack (2026-09-20) */
 		reg = <0x1a>;
 
 		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;

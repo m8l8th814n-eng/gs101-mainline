@@ -402,6 +402,12 @@ static u32 imx386_get_format_code(struct imx386 *imx386)
 	 * It depends on the flip settings.
 	 */
 	u32 code;
+	/*
+	 * Native RGGB (2026-09-20). Standard RGB Bayer colour order (not RYYB).
+	 * Reverted from the RGGB/BGGR/GRBG/GBRG phase-cycling: the colour issue
+	 * was never the CFA phase. Flips: hflip -> GRBG, vflip -> GBRG,
+	 * both -> BGGR.
+	 */
 	static const u32 codes[2][2] = {
 		{ MEDIA_BUS_FMT_SRGGB10_1X10, MEDIA_BUS_FMT_SGRBG10_1X10, },
 		{ MEDIA_BUS_FMT_SGBRG10_1X10, MEDIA_BUS_FMT_SBGGR10_1X10, },

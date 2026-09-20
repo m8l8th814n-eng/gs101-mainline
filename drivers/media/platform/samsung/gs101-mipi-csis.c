@@ -193,6 +193,9 @@ struct gs101_csis {
 	 * true SRGGB10P, until that layout gets its own pixel format.
 	 */
 	u32			wdma_fmt;
+	/* Per-instance default capture size from DT; falls back to GS101_CSIS_DEF_*. */
+	u32			def_width;
+	u32			def_height;
 	/*
 	 * Scratch frame the WDMA writes into while userspace has no buffer
 	 * queued. The channel is never disabled mid-stream: disabling it and
@@ -275,12 +278,13 @@ static const struct v4l2_subdev_video_ops gs101_csis_video_ops = {
 static int gs101_csis_init_state(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *state)
 {
+	struct gs101_csis *csis = sd_to_csis(sd);
 	struct v4l2_mbus_framefmt *fmt;
 
 	fmt = v4l2_subdev_state_get_format(state, GS101_CSIS_PAD_SINK);
-	fmt->width = GS101_CSIS_DEF_WIDTH;
-	fmt->height = GS101_CSIS_DEF_HEIGHT;
-	fmt->code = MEDIA_BUS_FMT_SBGGR10_1X10;	/* BGGR: a red object rendered blue as RGGB (2026-09-20) */
+	fmt->width = csis->def_width;
+	fmt->height = csis->def_height;
+	fmt->code = MEDIA_BUS_FMT_SRGGB10_1X10;	/* native RGGB; standard RGB Bayer (2026-09-20) */
 	fmt->field = V4L2_FIELD_NONE;
 	fmt->colorspace = V4L2_COLORSPACE_RAW;
 
@@ -765,6 +769,52 @@ static int gs101_csis_buf_prepare(struct vb2_buffer *vb)
 
 	vb2_set_plane_payload(vb, 0, csis->pixfmt.sizeimage);
 	return 0;
+}
+
+/* Effective WDMA FMT register value; mirrors the selection in hw_set_dma. */
+static u32 gs101_csis_effective_wdma_fmt(struct gs101_csis *csis)
+{
+	u32 val = gs101_csis_wdma_fmt >= 0 ? (u32)gs101_csis_wdma_fmt
+					   : csis->wdma_fmt;
+
+	return val ? val : gs101_csis_dma_fmt;
+}
+
+/*
+ * WDMA FMT 0x1e writes 4 pixels per 8 bytes: 4 MSB bytes, 1 LSB byte, 3 pad.
+ * Compact each line in place to the 5-byte groups of V4L2 SRGGB10P at the
+ * start of the width*2 stride, the same layout the front's 0x04 path uses.
+ * Runs at DQBUF in process context, after vb2 has synced the plane for the
+ * CPU. Destination never passes source, so memmove per group is safe.
+ */
+static void gs101_csis_buf_finish(struct vb2_buffer *vb)
+{
+	struct gs101_csis *csis = vb2_get_drv_priv(vb->vb2_queue);
+	u32 w = csis->pixfmt.width;
+	u32 h = csis->pixfmt.height;
+	u32 stride = csis->pixfmt.bytesperline;
+	u32 groups = w / 4;
+	u8 *base;
+	u32 y, g;
+
+	if (gs101_csis_effective_wdma_fmt(csis) != 0x1e)
+		return;
+	if (vb->state != VB2_BUF_STATE_DONE)
+		return;
+	if (stride < w * 2)
+		return;
+	base = vb2_plane_vaddr(vb, 0);
+	if (!base) {
+		dev_warn_ratelimited(csis->dev, "0x1e repack: no plane vaddr\n");
+		return;
+	}
+
+	for (y = 0; y < h; y++) {
+		u8 *line = base + (size_t)y * stride;
+
+		for (g = 0; g < groups; g++)
+			memmove(line + g * 5, line + g * 8, 5);
+	}
 }
 
 static void gs101_csis_buf_queue(struct vb2_buffer *vb)
@@ -1291,6 +1341,7 @@ static void gs101_csis_stop_streaming(struct vb2_queue *q)
 static const struct vb2_ops gs101_csis_vb2_ops = {
 	.queue_setup		= gs101_csis_queue_setup,
 	.buf_prepare		= gs101_csis_buf_prepare,
+	.buf_finish		= gs101_csis_buf_finish,
 	.buf_queue		= gs101_csis_buf_queue,
 	.start_streaming	= gs101_csis_start_streaming,
 	.stop_streaming		= gs101_csis_stop_streaming,
@@ -1342,7 +1393,7 @@ static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 {
 	u32 w, h;
 
-	pf->pixelformat = V4L2_PIX_FMT_SBGGR10P;	/* BGGR, see gs101_csis_init_state */
+	pf->pixelformat = V4L2_PIX_FMT_SRGGB10P;	/* native RGGB, see gs101_csis_init_state */
 	pf->field = V4L2_FIELD_NONE;
 	pf->colorspace = V4L2_COLORSPACE_RAW;
 	/*
@@ -1352,9 +1403,9 @@ static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 	 */
 	gs101_csis_link_size(csis, &w, &h);
 	if (!pf->width)
-		pf->width = w ? w : GS101_CSIS_DEF_WIDTH;
+		pf->width = w ? w : csis->def_width;
 	if (!pf->height)
-		pf->height = h ? h : GS101_CSIS_DEF_HEIGHT;
+		pf->height = h ? h : csis->def_height;
 	/* (was: RAW10 unpacked to 16 bit -- this WDMA writes 2 px per 8 bytes in that mode) */
 	/*
 	 * MIPI-packed RAW10 (4 px in 5 bytes) with a padded stride of 2 bytes
@@ -1392,7 +1443,7 @@ static int gs101_csis_enum_framesizes(struct file *file, void *priv,
 {
 	if (fsize->index)
 		return -EINVAL;
-	if (fsize->pixel_format != V4L2_PIX_FMT_SBGGR10P)
+	if (fsize->pixel_format != V4L2_PIX_FMT_SRGGB10P)
 		return -EINVAL;
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	gs101_csis_link_size(video_drvdata(file), &fsize->discrete.width,
@@ -1428,11 +1479,11 @@ static int gs101_csis_enum_fmt(struct file *file, void *priv,
 	 * node's formats filtered by the media bus code it set on the subdev
 	 * chain ("Media bus code filtering not supported" otherwise, 2026-09-19).
 	 * The WDMA writes whatever Bayer order the sensor sends, 10 bit in 16;
-	 * the only pixel format we expose is SBGGR10P (imx355/imx386 order).
+	 * the only pixel format we expose is SRGGB10P (imx355/imx386 order).
 	 */
-	if (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SBGGR10_1X10)
+	if (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SRGGB10_1X10)
 		return -EINVAL;
-	f->pixelformat = V4L2_PIX_FMT_SBGGR10P;
+	f->pixelformat = V4L2_PIX_FMT_SRGGB10P;
 	return 0;
 }
 
@@ -1766,6 +1817,13 @@ static int gs101_csis_probe(struct platform_device *pdev)
 				     csis->dma_ch);
 	csis->irq_ctx = csis->dma_ch;
 	of_property_read_u32(dev->of_node, "google,wdma-fmt", &csis->wdma_fmt);
+
+	/* Per-instance default capture size; front and rear use different modes. */
+	csis->def_width = GS101_CSIS_DEF_WIDTH;
+	csis->def_height = GS101_CSIS_DEF_HEIGHT;
+	of_property_read_u32(dev->of_node, "google,def-width", &csis->def_width);
+	of_property_read_u32(dev->of_node, "google,def-height", &csis->def_height);
+
 
 	/*
 	 * The csis-phy register bank (0x1A4F0000) belongs to the MIPI D/C-PHY
