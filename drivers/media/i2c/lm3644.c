@@ -117,6 +117,13 @@ struct lm3644_flash {
 
 	struct v4l2_ctrl_handler ctrls_led[LM3644_LED_MAX];
 	struct v4l2_subdev subdev_led[LM3644_LED_MAX];
+	/*
+	 * Own v4l2_device: no camera pipeline references this flash, so the
+	 * async subdevs never got adopted and had no /dev/v4l-subdev node.
+	 * Register them to our own v4l2_device and create the nodes directly
+	 * (2026-09-20) so the flash is controllable via V4L2_CID_FLASH_*.
+	 */
+	struct v4l2_device v4l2_dev;
 
 	u8 led0_enable;
 	u8 led1_enable;
@@ -426,7 +433,8 @@ static int lm3644_subdev_init(struct lm3644_flash *flash,
 		goto err_out;
 	flash->subdev_led[led_no].entity.function = MEDIA_ENT_F_FLASH;
 
-	rval = v4l2_async_register_subdev(&flash->subdev_led[led_no]);
+	rval = v4l2_device_register_subdev(&flash->v4l2_dev,
+					  &flash->subdev_led[led_no]);
 	if (rval < 0)
 		goto err_async;
 
@@ -442,7 +450,7 @@ err_out:
 static void lm3644_subdev_cleanup(struct lm3644_flash *flash,
 				  enum lm3644_led_id led_no)
 {
-	v4l2_async_unregister_subdev(&flash->subdev_led[led_no]);
+	v4l2_device_unregister_subdev(&flash->subdev_led[led_no]);
 	v4l2_ctrl_handler_free(&flash->ctrls_led[led_no]);
 	media_entity_cleanup(&flash->subdev_led[led_no].entity);
 }
@@ -547,15 +555,25 @@ static int lm3644_probe(struct i2c_client *client)
 
 	lm3644_parse_fwnode(flash);
 
+	rval = v4l2_device_register(&client->dev, &flash->v4l2_dev);
+	if (rval < 0)
+		return dev_err_probe(&client->dev, rval,
+				     "failed to register v4l2_device\n");
+
 	rval = lm3644_subdev_init(flash, LM3644_LED0, "lm3644-led0");
 	if (rval < 0)
-		return rval;
+		goto err_v4l2;
 
 	rval = lm3644_subdev_init(flash, LM3644_LED1, "lm3644-led1");
 	if (rval < 0)
 		goto err_led0;
 
 	rval = lm3644_init_device(flash);
+	if (rval < 0)
+		goto err_led1;
+
+	/* create the /dev/v4l-subdev nodes for both LEDs */
+	rval = v4l2_device_register_subdev_nodes(&flash->v4l2_dev);
 	if (rval < 0)
 		goto err_led1;
 
@@ -567,6 +585,8 @@ err_led1:
 	lm3644_subdev_cleanup(flash, LM3644_LED1);
 err_led0:
 	lm3644_subdev_cleanup(flash, LM3644_LED0);
+err_v4l2:
+	v4l2_device_unregister(&flash->v4l2_dev);
 	return rval;
 }
 
@@ -577,6 +597,8 @@ static void lm3644_remove(struct i2c_client *client)
 
 	for (i = LM3644_LED0; i < LM3644_LED_MAX; i++)
 		lm3644_subdev_cleanup(flash, i);
+
+	v4l2_device_unregister(&flash->v4l2_dev);
 }
 
 static const struct i2c_device_id lm3644_id_table[] = {

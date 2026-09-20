@@ -280,7 +280,7 @@ static int gs101_csis_init_state(struct v4l2_subdev *sd,
 	fmt = v4l2_subdev_state_get_format(state, GS101_CSIS_PAD_SINK);
 	fmt->width = GS101_CSIS_DEF_WIDTH;
 	fmt->height = GS101_CSIS_DEF_HEIGHT;
-	fmt->code = MEDIA_BUS_FMT_SRGGB10_1X10;	/* was SGRBG10: the sensors send RGGB */
+	fmt->code = MEDIA_BUS_FMT_SBGGR10_1X10;	/* BGGR: a red object rendered blue as RGGB (2026-09-20) */
 	fmt->field = V4L2_FIELD_NONE;
 	fmt->colorspace = V4L2_COLORSPACE_RAW;
 
@@ -1342,7 +1342,7 @@ static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 {
 	u32 w, h;
 
-	pf->pixelformat = V4L2_PIX_FMT_SRGGB10P;
+	pf->pixelformat = V4L2_PIX_FMT_SBGGR10P;	/* BGGR, see gs101_csis_init_state */
 	pf->field = V4L2_FIELD_NONE;
 	pf->colorspace = V4L2_COLORSPACE_RAW;
 	/*
@@ -1392,7 +1392,7 @@ static int gs101_csis_enum_framesizes(struct file *file, void *priv,
 {
 	if (fsize->index)
 		return -EINVAL;
-	if (fsize->pixel_format != V4L2_PIX_FMT_SRGGB10P)
+	if (fsize->pixel_format != V4L2_PIX_FMT_SBGGR10P)
 		return -EINVAL;
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	gs101_csis_link_size(video_drvdata(file), &fsize->discrete.width,
@@ -1428,11 +1428,11 @@ static int gs101_csis_enum_fmt(struct file *file, void *priv,
 	 * node's formats filtered by the media bus code it set on the subdev
 	 * chain ("Media bus code filtering not supported" otherwise, 2026-09-19).
 	 * The WDMA writes whatever Bayer order the sensor sends, 10 bit in 16;
-	 * the only pixel format we expose is SRGGB10P (imx355/imx386 order).
+	 * the only pixel format we expose is SBGGR10P (imx355/imx386 order).
 	 */
-	if (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SRGGB10_1X10)
+	if (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SBGGR10_1X10)
 		return -EINVAL;
-	f->pixelformat = V4L2_PIX_FMT_SRGGB10P;
+	f->pixelformat = V4L2_PIX_FMT_SBGGR10P;
 	return 0;
 }
 
