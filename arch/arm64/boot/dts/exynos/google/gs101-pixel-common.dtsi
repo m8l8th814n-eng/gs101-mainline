@@ -18,6 +18,7 @@
 #include "gs101-cp-rmem.dtsi"
 #include "gs101-cp-nodes.dtsi"
 #include "gs101-cp-spi.dtsi"
+#include <dt-bindings/media/video-interfaces.h>
 
 / {
 	aliases {
@@ -440,7 +441,7 @@
 				csis1_sink: endpoint {
 					remote-endpoint = <&s5kgn1_ep>;
 					/* GN1 is C-PHY, 3 trios (proven 2026-09-21: FRM_CNT + WDMA frames). */
-					bus-type = <3>;		/* V4L2_FWNODE_BUS_TYPE_CSI2_CPHY */
+					bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
 					data-lanes = <1 2 3>;
 					/* The driver reads the rate from its own sink endpoint (default 360 MHz). */
 					link-frequencies = /bits/ 64 <798000000>;
@@ -2115,7 +2116,7 @@
 		port {
 			s5kgn1_ep: endpoint {
 				remote-endpoint = <&csis1_sink>;
-				bus-type = <3>;		/* C-PHY, see csis1_sink */
+				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;	/* C-PHY, see csis1_sink */
 				data-lanes = <1 2 3>;
 				link-frequencies = /bits/ 64 <798000000>;
 			};
