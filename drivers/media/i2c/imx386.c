@@ -42,6 +42,10 @@
 #define IMX386_ANA_GAIN_STEP		1
 #define IMX386_ANA_GAIN_DEFAULT		0
 
+/* Effective pixel array, reported as NATIVE_SIZE and CROP_BOUNDS. */
+#define IMX386_PIXEL_ARRAY_WIDTH	4032
+#define IMX386_PIXEL_ARRAY_HEIGHT	3024
+
 /* Digital gain control */
 #define IMX386_REG_DPGA_USE_GLOBAL_GAIN	0x3070
 #define IMX386_REG_DIG_GAIN_GLOBAL	0x020e
@@ -109,6 +113,9 @@ struct imx386_mode {
 
 	/* Default register values */
 	struct imx386_reg_list reg_list;
+
+	/* Analogue crop on the pixel array (regs 0x0344-0x034b), V4L2_SEL_TGT_CROP */
+	struct v4l2_rect crop;
 };
 
 struct imx386_hwcfg {
@@ -386,6 +393,7 @@ static const struct imx386_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_1920x1080_regs),
 			.regs = mode_1920x1080_regs,
 		},
+		.crop = { .left = 96, .top = 428, .width = 3840, .height = 2160 },
 	},
 };
 
@@ -840,7 +848,48 @@ static const struct v4l2_subdev_video_ops imx386_video_ops = {
 	.s_stream = imx386_set_stream,
 };
 
+/*
+ * Selection API libcamera requires (camera_sensor_legacy.cpp: pixel array
+ * size, active area and the analogue crop of the current mode). 2026-09-20.
+ */
+static int imx386_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct imx386 *imx386 = to_imx386(sd);
+	const struct imx386_mode *mode;
+	const struct v4l2_mbus_framefmt *fmt;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = IMX386_PIXEL_ARRAY_WIDTH;
+		sel->r.height = IMX386_PIXEL_ARRAY_HEIGHT;
+		return 0;
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
+			fmt = v4l2_subdev_state_get_format(sd_state, 0);
+			mode = v4l2_find_nearest_size(supported_modes,
+						      ARRAY_SIZE(supported_modes),
+						      width, height,
+						      fmt->width, fmt->height);
+		} else {
+			mutex_lock(&imx386->mutex);
+			mode = imx386->cur_mode;
+			mutex_unlock(&imx386->mutex);
+		}
+		sel->r = mode->crop;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct v4l2_subdev_pad_ops imx386_pad_ops = {
+	.get_selection = imx386_get_selection,
 	.enum_mbus_code = imx386_enum_mbus_code,
 	.get_fmt = imx386_get_pad_format,
 	.set_fmt = imx386_set_pad_format,

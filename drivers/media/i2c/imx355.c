@@ -43,6 +43,10 @@
 #define IMX355_ANA_GAIN_STEP		1
 #define IMX355_ANA_GAIN_DEFAULT		0
 
+/* Effective pixel array, reported as NATIVE_SIZE and CROP_BOUNDS. */
+#define IMX355_PIXEL_ARRAY_WIDTH	3280
+#define IMX355_PIXEL_ARRAY_HEIGHT	2464
+
 /* Digital gain control */
 #define IMX355_REG_DPGA_USE_GLOBAL_GAIN	0x3070
 #define IMX355_REG_DIG_GAIN_GLOBAL	0x020e
@@ -112,6 +116,9 @@ struct imx355_mode {
 
 	/* Default register values */
 	struct imx355_reg_list reg_list;
+
+	/* Analogue crop on the pixel array (regs 0x0344-0x034b), V4L2_SEL_TGT_CROP */
+	struct v4l2_rect crop;
 };
 
 struct imx355_hwcfg {
@@ -949,12 +956,6 @@ static const s64 link_freq_menu_items[] = {
 
 /* Mode configs */
 static const struct imx355_mode supported_modes[] = {
-#if 0	/*
-	 * 2026-09-20: these seven modes run with binning off (0x0901 = 0x11)
-	 * and emit raw Quad Bayer, which libcamera's software ISP cannot
-	 * demosaic. Only the 2x2-binned modes stay, so [0] and the largest
-	 * size are 1640x1232. Re-enable when a Quad-aware ISP path exists.
-	 */
 	{
 		.width = 3280,
 		.height = 2464,
@@ -966,7 +967,16 @@ static const struct imx355_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_3280x2464_regs),
 			.regs = mode_3280x2464_regs,
 		},
+		.crop = { .left = 0, .top = 0, .width = 3280, .height = 2464 },
 	},
+#if 0	/*
+	 * 2026-09-20: these six modes run with binning off (0x0901 = 0x11) on
+	 * a cropped window; the full-resolution mode above stays because the
+	 * WDMA packing is only proven correct at 3280x2464 (0x04, 4 of 4
+	 * pixel bytes live), and the Quad Bayer cell collapse is done by
+	 * libcamera (sensor_cfa_layout). The binned modes below the block
+	 * stay available.
+	 */
 	{
 		.width = 3268,
 		.height = 2448,
@@ -1051,6 +1061,7 @@ static const struct imx355_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_1640x1232_regs),
 			.regs = mode_1640x1232_regs,
 		},
+		.crop = { .left = 0, .top = 0, .width = 3280, .height = 2464 },
 	},
 	{
 		.width = 1640,
@@ -1063,6 +1074,7 @@ static const struct imx355_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_1640x922_regs),
 			.regs = mode_1640x922_regs,
 		},
+		.crop = { .left = 0, .top = 304, .width = 3280, .height = 1844 },
 	},
 	{
 		.width = 1300,
@@ -1075,6 +1087,7 @@ static const struct imx355_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_1300x736_regs),
 			.regs = mode_1300x736_regs,
 		},
+		.crop = { .left = 344, .top = 496, .width = 2600, .height = 1472 },
 	},
 	{
 		.width = 1296,
@@ -1087,6 +1100,7 @@ static const struct imx355_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_1296x736_regs),
 			.regs = mode_1296x736_regs,
 		},
+		.crop = { .left = 344, .top = 496, .width = 2592, .height = 1472 },
 	},
 	{
 		.width = 1284,
@@ -1099,6 +1113,7 @@ static const struct imx355_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_1284x720_regs),
 			.regs = mode_1284x720_regs,
 		},
+		.crop = { .left = 360, .top = 512, .width = 2568, .height = 1440 },
 	},
 	{
 		.width = 1280,
@@ -1111,6 +1126,7 @@ static const struct imx355_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_1280x720_regs),
 			.regs = mode_1280x720_regs,
 		},
+		.crop = { .left = 360, .top = 512, .width = 2560, .height = 1440 },
 	},
 #if 0	/* 2026-09-20: 4x4 binning; the WDMA never completed a frame at this size (2026-09-19). */
 	{
@@ -1586,7 +1602,48 @@ static const struct v4l2_subdev_video_ops imx355_video_ops = {
 	.s_stream = imx355_set_stream,
 };
 
+/*
+ * Selection API libcamera requires (camera_sensor_legacy.cpp: pixel array
+ * size, active area and the analogue crop of the current mode). 2026-09-20.
+ */
+static int imx355_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct imx355 *imx355 = to_imx355(sd);
+	const struct imx355_mode *mode;
+	const struct v4l2_mbus_framefmt *fmt;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = IMX355_PIXEL_ARRAY_WIDTH;
+		sel->r.height = IMX355_PIXEL_ARRAY_HEIGHT;
+		return 0;
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
+			fmt = v4l2_subdev_state_get_format(sd_state, 0);
+			mode = v4l2_find_nearest_size(supported_modes,
+						      ARRAY_SIZE(supported_modes),
+						      width, height,
+						      fmt->width, fmt->height);
+		} else {
+			mutex_lock(&imx355->mutex);
+			mode = imx355->cur_mode;
+			mutex_unlock(&imx355->mutex);
+		}
+		sel->r = mode->crop;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct v4l2_subdev_pad_ops imx355_pad_ops = {
+	.get_selection = imx355_get_selection,
 	.enum_mbus_code = imx355_enum_mbus_code,
 	.get_fmt = imx355_get_pad_format,
 	.set_fmt = imx355_set_pad_format,

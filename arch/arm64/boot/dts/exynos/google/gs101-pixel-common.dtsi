@@ -290,9 +290,17 @@
 		clock-names = "apb", "c2", "dma", "ebuf", "qe-aclk", "qe-pclk",
 			      "phy-wrap", "cam-dvfs";
 		phys = <&mipi_phy_csis4 0>;	/* was <&mipi_phy_csis0 0> */
-		/* imx355 1640x1232 = 2x2 binning mode (0x0900=1, 0x0901=0x22) */
-		google,def-width = <1640>;
-		google,def-height = <1232>;
+		/* imx355 full resolution; must match the sensor's default mode. */
+		google,def-width = <3280>;
+		google,def-height = <2464>;
+		/*
+		 * 2026-09-21: front stays on WDMA FMT 0x4 (U10BIT_PACK, SRGGB10P):
+		 * the only layout measured with all 4 pixel bytes live (at 3280 px),
+		 * and libcamera's quad-Bayer cell collapse (0008) takes the packed
+		 * input only; with the driver default 6 (RG10) every front
+		 * configuration was rejected ("No valid configuration found").
+		 */
+		google,wdma-fmt = <0x4>;
 		/*
 		 * SYSREG_CSIS: the WDMA input routing (stock HAL csi_context.cc:
 		 * 0x430 + slot*4 = link, 0x408 + ctx*4 = slot, 0x488 enable bit
@@ -363,7 +371,12 @@
 		 * the dense SRGGB10P value never completes a 1920-px line on this
 		 * link (2026-09-19). See the driver's wdma_fmt.
 		 */
-		google,wdma-fmt = <0x1e>;
+		/*
+		 * 2026-09-21: 0x1e (S14BIT_UNPACK_MSB_ZERO) commented out so the
+		 * rear takes the driver default 6 (U10BIT_UNPACK_MSB_ZERO, V4L2
+		 * SRGGB10) like the front; same 16-bit-per-pixel DMA geometry.
+		 */
+		/* google,wdma-fmt = <0x1e>; */
 
 		ports {
 			#address-cells = <1>;
@@ -375,6 +388,62 @@
 				csis2_sink: endpoint {
 					remote-endpoint = <&imx386_ep>;
 					data-lanes = <1 2>;	/* see imx386_ep */
+				};
+			};
+		};
+	};
+
+	/*
+	 * csis1: rear main camera GN1 (4-lane) on WDMA vc2. Link/DCPHY bank NOT
+	 * yet probed for this sensor (front = dcphy4, imx386 = dcphy1); link0 /
+	 * dcphy0 is the first candidate (2026-09-21).
+	 */
+	gs101_csis1: mipi-csis@1a440000 {
+		compatible = "google,gs101-mipi-csis";
+		reg = <0x0 0x1A440000 0x1000>,   /* csis-link0 */
+		      <0x0 0x1A4D0000 0x10000>,  /* csis-dma (WDMA, shared) */
+		      <0x0 0x1A4C0000 0x100>;    /* csis-ebuf (elastic buffer, shared) */
+		reg-names = "csis-link0", "csis-dma", "csis-ebuf";
+		/* WDMA vc2 frame-done (IRQ_CSIS_DMA2_CSIS = SPI 304) + link0 IRQ
+		 * (IRQ_CSIS0_CSIS = SPI 294).
+		 */
+		interrupts = <GIC_SPI 304 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 294 IRQ_TYPE_LEVEL_HIGH 0>;
+		interrupt-names = "csis-dma2", "csis-link0";
+		clocks = <&cmu_csis CLK_GOUT_CSIS_AD_APB_CSIS0_PCLKM>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_C2_CSIS>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_CSIS_DMA>,
+			 <&cmu_csis CLK_GOUT_CSIS_CSISX8_ACLK_EBUF>,
+			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA2_ACLK>,
+			 <&cmu_csis CLK_GOUT_CSIS_QE_CSIS_DMA2_PCLK>,
+			 <&cmu_csis CLK_GOUT_CSIS_MIPI_PHY_LINK_WRAP_ACLK_CSIS0>,
+			 <&acpm_ipc GS101_CLK_ACPM_DVFS_CAM>;
+		clock-names = "apb", "c2", "dma", "ebuf", "qe-aclk", "qe-pclk",
+			      "phy-wrap", "cam-dvfs";
+		phys = <&mipi_phy_csis0 0>;
+		/* s5kgn1 default mode 4080x3072 (2x2 binned). */
+		google,def-width = <4080>;
+		google,def-height = <3072>;
+		/* Packed RAW10 (SRGGB10P): 15.7 MB per frame instead of 25 MB unpacked. */
+		google,wdma-fmt = <0x4>;
+		samsung,sysreg = <&sysreg_csis>;
+		memory-region = <&camera_cma>;
+		google,csis-dma-vc = <2>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* sink from the rear main camera (GN1) */
+			port@0 {
+				reg = <0>;
+				csis1_sink: endpoint {
+					remote-endpoint = <&s5kgn1_ep>;
+					/* GN1 is C-PHY, 3 trios (proven 2026-09-21: FRM_CNT + WDMA frames). */
+					bus-type = <3>;		/* V4L2_FWNODE_BUS_TYPE_CSI2_CPHY */
+					data-lanes = <1 2 3>;
+					/* The driver reads the rate from its own sink endpoint (default 360 MHz). */
+					link-frequencies = /bits/ 64 <798000000>;
 				};
 			};
 		};
@@ -407,7 +476,10 @@
 		camera_cma: camera-cma@d0000000 {
 			compatible = "shared-dma-pool";
 			reusable;
-			reg = <0x0 0xd0000000 0x08000000>;	/* 128 MiB */
+			/* 2026-09-21: 256 MiB; three cameras, and 128 MiB fragmented into
+			 * 29 MiB free with a 25 MiB GN1 frame -> dma_alloc -EBUSY.
+			 */
+			reg = <0x0 0xd0000000 0x10000000>;	/* 256 MiB (was 128) */
 		};
 	};
 };
@@ -1397,8 +1469,20 @@
 		dlg,buck-gpios = <&s2mpg11_gpio 3 GPIO_ACTIVE_HIGH>;
 		dlg,cs-gpios = <&s2mpg11_gpio 0 GPIO_ACTIVE_HIGH>;
 		dlg,pu-gpios = <&s2mpg11_gpio 4 GPIO_ACTIVE_HIGH>;
+		/* GPIO1..4 outputs: rear main camera (GN1) module enables. */
+		gpio-controller;
+		#gpio-cells = <2>;
 
 		regulators {
+			/*
+			 * 2026-09-21: the "bias pairing" below is the production
+			 * OTP mux (regmap 0x1715..0x171b = 03 05 2c 04 05 2d 02):
+			 * enable bit0 -> LDO7, bit1 -> LDO1, bit2 -> LDO4,
+			 * bit3 -> LDO2+LDO5, bit4 -> LUT -> LDO6, bit6 -> GPIO4.
+			 * So "ldoN" here switches a different physical LDO than
+			 * its name; VSEL registers are still per physical LDO.
+			 * Verified with i2ctransfer on MATRIX_CONF_A (0x110d).
+			 */
 			/*
 			 * SLG51000 LDO bias pairing (found empirically on the
 			 * device): an LDO only reaches VOUT_OK if its bias
@@ -1465,6 +1549,10 @@
 				regulator-boot-on;
 			};
 
+			/*
+			 * Vendor proto1 DT: ldo4 is the GN1 (rear main camera)
+			 * dvdd, with ldo1 = avdd and ldo7 = dovdd (2026-09-21).
+			 */
 			/*
 			 * ldo4 is not wired to a sensor rail, but it is the bias
 			 * companion that lets ldo2 (imx386 avdd) and ldo5 reach
@@ -1919,11 +2007,15 @@
 		 * PLL tap divides to exactly 24 MHz; parent shared2/2 = 400 MHz
 		 * gives 400/17 = 23.53 MHz, which the sensor tolerates (the driver
 		 * matches the 24 MHz table within 5%).
+		 * 2026-09-21: exact 24 MHz via the otherwise unused spare PLL,
+		 * programmed to 768 MHz (rate table in clk-gs101.c), divider /32.
 		 */
-		assigned-clocks = <&cmu_top CLK_MOUT_CMU_CIS_CLK1>,
+		assigned-clocks = <&cmu_top CLK_FOUT_SPARE_PLL>,
+				  <&cmu_top CLK_MOUT_CMU_CIS_CLK1>,
 				  <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
-		assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_SHARED2_DIV2>;
-		assigned-clock-rates = <0>, <24000000>;
+		assigned-clock-parents = <0>,
+					 <&cmu_top CLK_FOUT_SPARE_PLL>;
+		assigned-clock-rates = <768000000>, <0>, <24000000>;
 
 		reset-gpios = <&gpp4 2 GPIO_ACTIVE_LOW>;
 
@@ -1965,6 +2057,72 @@
 	};
 };
 
+/* Enable the USI1 wrapper in I2C mode so hsi2c_1 (rear main camera bus) comes up. */
+&usi1 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+/*
+ * Rear main camera: Samsung S5KGN1 on HSI2C bus 1 (@0x3d), 4-lane MIPI,
+ * CIS_CLK3 on sensor_mclk4, reset gpp2-2. Rails and enables from the vendor
+ * DT (gs101-oriole-camera.dtsi + proto1 overlay): ldo1 avdd, ldo4 dvdd,
+ * ldo7 dovdd, SLG51000 GPIO 2/0/1 as "enable"/"shared-enable1/2".
+ */
+&hsi2c_1 {
+	status = "okay";
+
+	s5kgn1: camera-sensor@3d {
+		compatible = "samsung,s5kgn1";
+		orientation = <1>;
+		rotation = <90>;
+		reg = <0x3d>;
+
+		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK3>;
+		/* exact 24 MHz from the spare PLL at 768 MHz, divider /32 (see imx355). */
+		assigned-clocks = <&cmu_top CLK_FOUT_SPARE_PLL>,
+				  <&cmu_top CLK_MOUT_CMU_CIS_CLK3>,
+				  <&cmu_top CLK_DOUT_CMU_CIS_CLK3>;
+		assigned-clock-parents = <0>,
+					 <&cmu_top CLK_FOUT_SPARE_PLL>;
+		assigned-clock-rates = <768000000>, <0>, <24000000>;
+
+		reset-gpios = <&gpp2 2 GPIO_ACTIVE_LOW>;
+		enable-gpios = <&slg51000 2 GPIO_ACTIVE_HIGH>,
+			       <&slg51000 0 GPIO_ACTIVE_HIGH>,
+			       <&slg51000 1 GPIO_ACTIVE_HIGH>;
+
+		/*
+		 * 2026-09-21: the production SLG51000 OTP routes the enable bits
+		 * through its mux array (0x1715..0x171b read 03 05 2c 04 05 2d 02):
+		 * framework "ldo1" (bit0) -> physical LDO7 1.8 V, "ldo2" (bit1) ->
+		 * LDO1 2.8 V, "ldo3" (bit2) -> LDO4 2.9 V, "ldo4" (bit3) -> LDO2 +
+		 * LDO5, "ldo5" (bit4) -> LUT -> LDO6, "ldo7" (bit6) -> GPIO4.
+		 * Vendor production GN1 = ldo1 + ldo2 + ldo3. With ldo1/ldo4/ldo7
+		 * (proto1 names) the sensor had no 2.8/2.9 V rail and died at
+		 * stream-on; with bits 1+2 forced on it streams (runtime test).
+		 */
+		/* avdd-supply = <&slg51000_ldo1>; */
+		/* dvdd-supply = <&slg51000_ldo4>; */
+		/* dovdd-supply = <&slg51000_ldo7>; */
+		avdd-supply = <&slg51000_ldo2>;		/* bit1 -> LDO1 2.8 V */
+		dvdd-supply = <&slg51000_ldo3>;		/* bit2 -> LDO4 2.9 V (production "ldo3"; not a core rail) */
+		dovdd-supply = <&slg51000_ldo1>;	/* bit0 -> LDO7 1.8 V */
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&sensor_mclk4_fn>;
+
+		port {
+			s5kgn1_ep: endpoint {
+				remote-endpoint = <&csis1_sink>;
+				bus-type = <3>;		/* C-PHY, see csis1_sink */
+				data-lanes = <1 2 3>;
+				link-frequencies = /bits/ 64 <798000000>;
+			};
+		};
+	};
+};
+
 /* Enable the USI3 wrapper in I2C mode so hsi2c_3 (rear camera bus) comes up. */
 &usi3 {
 	samsung,mode = <USI_MODE_I2C>;
@@ -1988,10 +2146,13 @@
 
 		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
 		/* Vendor: CIS_CLK0 requested at 24000000 (24 MHz sensor tables); see imx355. */
-		assigned-clocks = <&cmu_top CLK_MOUT_CMU_CIS_CLK0>,
+		/* 2026-09-21: exact 24 MHz from the spare PLL at 768 MHz, divider /32. */
+		assigned-clocks = <&cmu_top CLK_FOUT_SPARE_PLL>,
+				  <&cmu_top CLK_MOUT_CMU_CIS_CLK0>,
 				  <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;
-		assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_SHARED2_DIV2>;
-		assigned-clock-rates = <0>, <24000000>;
+		assigned-clock-parents = <0>,
+					 <&cmu_top CLK_FOUT_SPARE_PLL>;
+		assigned-clock-rates = <768000000>, <0>, <24000000>;
 
 		reset-gpios = <&gpp6 3 GPIO_ACTIVE_LOW>;
 

@@ -1524,6 +1524,17 @@ enum is_hw_csi_ebuf_reg_name {
 	CSIS_EBUF_R_EBUF_INTR_STATUS,
 	CSIS_EBUF_R_EBUF_INTR_ENABLE,
 	CSIS_EBUF_R_EBUF_INTR_CLEAR,
+	/*
+	 * Per-channel buffer level threshold, offset 0x1c + 0x20 * ch. Not in
+	 * pablo's table (which skips 0x1c); from the stock HAL register table
+	 * (hal_csis_regtable.txt, ebuf0_buffer_level_threshold). Appended here
+	 * so the existing "+ 6 * ch" indexing of the per-channel block stays
+	 * valid; index these as EBUF0_... + ch.
+	 */
+	CSIS_EBUF_R_EBUF0_BUFFER_LEVEL_THRESHOLD,
+	CSIS_EBUF_R_EBUF1_BUFFER_LEVEL_THRESHOLD,
+	CSIS_EBUF_R_EBUF2_BUFFER_LEVEL_THRESHOLD,
+	CSIS_EBUF_R_EBUF3_BUFFER_LEVEL_THRESHOLD,
 	CSIS_EBUF_REG_CNT
 };
 
@@ -1557,6 +1568,10 @@ static const struct is_reg csi_ebuf_regs[CSIS_EBUF_REG_CNT] = {
 	{0X00D0, "EBUF_INTR_STATUS"},
 	{0X00D4, "EBUF_INTR_ENABLE"},
 	{0X00D8, "EBUF_INTR_CLEAR"},
+	{0X001C, "EBUF0_BUFFER_LEVEL_THRESHOLD"},
+	{0X003C, "EBUF1_BUFFER_LEVEL_THRESHOLD"},
+	{0X005C, "EBUF2_BUFFER_LEVEL_THRESHOLD"},
+	{0X007C, "EBUF3_BUFFER_LEVEL_THRESHOLD"},
 };
 
 enum is_hw_csi_ebuf_reg_field {

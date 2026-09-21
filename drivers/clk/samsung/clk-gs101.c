@@ -639,6 +639,17 @@ static const unsigned long top_clk_regs[] __initconst = {
 	GENERALIO_ACD_MASK,
 };
 
+/*
+ * The spare PLL is unused by the SoC; give it one rate so the camera sensor
+ * master clocks can be exactly 24 MHz: 24.576 MHz * 250 / (4 * 2^1) =
+ * 768 MHz, then CIS_CLKn divider /32. No shared PLL tap divides to 24 MHz
+ * (the closest are 23.49 and 24.576 MHz). 2026-09-21.
+ */
+static const struct samsung_pll_rate_table spare_pll_rates[] __initconst = {
+	PLL_35XX_RATE(24576000, 768000000, 250, 4, 1),
+	{ /* sentinel */ }
+};
+
 static const struct samsung_pll_clock top_pll_clks[] __initconst = {
 	/* CMU_TOP_PURECLKCOMP */
 	PLL(pll_0517x, CLK_FOUT_SHARED0_PLL, "fout_shared0_pll", "oscclk",
@@ -655,7 +666,7 @@ static const struct samsung_pll_clock top_pll_clks[] __initconst = {
 	    NULL),
 	PLL(pll_0518x, CLK_FOUT_SPARE_PLL, "fout_spare_pll", "oscclk",
 	    PLL_LOCKTIME_PLL_SPARE, PLL_CON3_PLL_SPARE,
-	    NULL),
+	    spare_pll_rates),
 };
 
 /* List of parent clocks for Muxes in CMU_TOP */

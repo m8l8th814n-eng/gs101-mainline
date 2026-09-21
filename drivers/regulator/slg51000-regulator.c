@@ -7,12 +7,14 @@
 
 #include <linux/err.h>
 #include <linux/gpio/consumer.h>
+#include <linux/gpio/driver.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/machine.h>
@@ -35,7 +37,22 @@ enum slg51000_regulators {
 	SLG51000_MAX_REGULATORS,
 };
 
+/*
+ * GPIO1..4 output control (vendor pinctrl-slg51000.c): direction bit 7 of
+ * IO_GPIOn_CONF, level in MUXARRAY_INPUT_SEL_16..19, both only writable in
+ * software test mode (0x111a..0x111d = 0x45 0x53 0x54 0x4d, left with
+ * SYSCTL_TEST_EN = 0).
+ */
+#define SLG51000_SYSCTL_TEST_EN			0x1119
+#define SLG51000_TEST_EN_OFF			0x00
+#define SLG51000_SW_TEST_MODE_1			0x111a
+#define SLG51000_SW_TEST_MODE_4			0x111d
+#define SLG51000_GPIO_DIR_OUT			BIT(7)
+#define SLG51000_GPIO_CTRL(n)			(SLG51000_MUXARRAY_INPUT_SEL_0 + 16 + (n))
+#define SLG51000_NUM_GPIOS			4
+
 struct slg51000 {
+	struct gpio_chip gc;
 	struct device *dev;
 	struct regmap *regmap;
 	struct regulator_desc *rdesc[SLG51000_MAX_REGULATORS];
@@ -70,6 +87,9 @@ static const struct slg51000_evt_sta es_reg[SLG51000_MAX_EVT_REGISTER] = {
 };
 
 static const struct regmap_range slg51000_writeable_ranges[] = {
+	regmap_reg_range(SLG51000_SYSCTL_TEST_EN, SLG51000_SW_TEST_MODE_4),
+	regmap_reg_range(SLG51000_IO_GPIO1_CONF, SLG51000_IO_GPIO4_CONF),
+	regmap_reg_range(SLG51000_GPIO_CTRL(0), SLG51000_GPIO_CTRL(3)),
 	regmap_reg_range(SLG51000_SYSCTL_MATRIX_CONF_A,
 			 SLG51000_SYSCTL_MATRIX_CONF_A),
 	regmap_reg_range(SLG51000_LDO1_VSEL, SLG51000_LDO1_VSEL),
@@ -97,6 +117,7 @@ static const struct regmap_range slg51000_writeable_ranges[] = {
 };
 
 static const struct regmap_range slg51000_readable_ranges[] = {
+	regmap_reg_range(SLG51000_SYSCTL_TEST_EN, SLG51000_SW_TEST_MODE_4),
 	regmap_reg_range(SLG51000_SYSCTL_PATN_ID_B0,
 			 SLG51000_SYSCTL_PATN_ID_B2),
 	regmap_reg_range(SLG51000_SYSCTL_SYS_CONF_A,
@@ -151,6 +172,9 @@ static const struct regmap_range slg51000_readable_ranges[] = {
 };
 
 static const struct regmap_range slg51000_volatile_ranges[] = {
+	regmap_reg_range(SLG51000_SYSCTL_TEST_EN, SLG51000_SW_TEST_MODE_4),
+	regmap_reg_range(SLG51000_IO_GPIO1_CONF, SLG51000_IO_GPIO4_CONF),
+	regmap_reg_range(SLG51000_GPIO_CTRL(0), SLG51000_GPIO_CTRL(3)),
 	regmap_reg_range(SLG51000_SYSCTL_FAULT_LOG1, SLG51000_SYSCTL_STATUS),
 	regmap_reg_range(SLG51000_IO_GPIO_STATUS, SLG51000_IO_GPIO_STATUS),
 	regmap_reg_range(SLG51000_LDO1_EVENT, SLG51000_LDO1_STATUS),
@@ -444,6 +468,110 @@ static void slg51000_clear_fault_log(struct slg51000 *chip)
 		dev_dbg(chip->dev, "Fault log: FLT_POR\n");
 }
 
+static int slg51000_sw_test_mode(struct regmap *map, bool on)
+{
+	static const u8 on_vals[] = { 0x45, 0x53, 0x54, 0x4d };
+
+	if (!on)
+		return regmap_write(map, SLG51000_SYSCTL_TEST_EN,
+				    SLG51000_TEST_EN_OFF);
+
+	return regmap_bulk_write(map, SLG51000_SW_TEST_MODE_1, on_vals,
+				 ARRAY_SIZE(on_vals));
+}
+
+static int slg51000_gpio_get(struct gpio_chip *gc, unsigned int offset)
+{
+	struct slg51000 *chip = gpiochip_get_data(gc);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(chip->regmap, SLG51000_GPIO_CTRL(offset), &val);
+	if (ret)
+		return ret;
+
+	return val & 1;
+}
+
+static int slg51000_gpio_set(struct gpio_chip *gc, unsigned int offset,
+			     int value)
+{
+	struct slg51000 *chip = gpiochip_get_data(gc);
+	int ret, err;
+
+	ret = slg51000_sw_test_mode(chip->regmap, true);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(chip->regmap, SLG51000_GPIO_CTRL(offset), !!value);
+
+	err = slg51000_sw_test_mode(chip->regmap, false);
+	if (ret || err)
+		dev_err(chip->dev, "gpio%u set %d failed (%d/%d)\n", offset + 1,
+			!!value, ret, err);
+
+	return ret ? ret : err;
+}
+
+static int slg51000_gpio_direction_output(struct gpio_chip *gc,
+					  unsigned int offset, int value)
+{
+	struct slg51000 *chip = gpiochip_get_data(gc);
+	int ret, err;
+
+	ret = slg51000_sw_test_mode(chip->regmap, true);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(chip->regmap, SLG51000_IO_GPIO1_CONF + offset,
+				 SLG51000_GPIO_DIR_OUT, SLG51000_GPIO_DIR_OUT);
+	if (!ret)
+		ret = regmap_write(chip->regmap, SLG51000_GPIO_CTRL(offset),
+				   !!value);
+
+	err = slg51000_sw_test_mode(chip->regmap, false);
+	if (ret || err)
+		dev_err(chip->dev, "gpio%u direction out failed (%d/%d)\n",
+			offset + 1, ret, err);
+
+	return ret ? ret : err;
+}
+
+static int slg51000_gpio_get_direction(struct gpio_chip *gc,
+				       unsigned int offset)
+{
+	struct slg51000 *chip = gpiochip_get_data(gc);
+	unsigned int val;
+	int ret;
+
+	ret = regmap_read(chip->regmap, SLG51000_IO_GPIO1_CONF + offset, &val);
+	if (ret)
+		return ret;
+
+	return (val & SLG51000_GPIO_DIR_OUT) ? GPIO_LINE_DIRECTION_OUT :
+					       GPIO_LINE_DIRECTION_IN;
+}
+
+/* GPIO1..4 as outputs (camera module enables); only with "gpio-controller". */
+static int slg51000_gpio_init(struct slg51000 *chip)
+{
+	if (!device_property_present(chip->dev, "gpio-controller"))
+		return 0;
+
+	chip->gc.label = "slg51000";
+	chip->gc.parent = chip->dev;
+	chip->gc.owner = THIS_MODULE;
+	chip->gc.base = -1;
+	chip->gc.ngpio = SLG51000_NUM_GPIOS;
+	chip->gc.can_sleep = true;
+	chip->gc.get = slg51000_gpio_get;
+	chip->gc.set = slg51000_gpio_set;
+	chip->gc.direction_output = slg51000_gpio_direction_output;
+	chip->gc.get_direction = slg51000_gpio_get_direction;
+
+	return devm_gpiochip_add_data(chip->dev, &chip->gc, chip);
+}
+
 static int slg51000_i2c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -532,6 +660,12 @@ static int slg51000_i2c_probe(struct i2c_client *client)
 	ret = slg51000_regulator_init(chip);
 	if (ret < 0) {
 		dev_err(chip->dev, "Failed to init regulator(%d)\n", ret);
+		return ret;
+	}
+
+	ret = slg51000_gpio_init(chip);
+	if (ret < 0) {
+		dev_err(chip->dev, "Failed to init gpio(%d)\n", ret);
 		return ret;
 	}
 

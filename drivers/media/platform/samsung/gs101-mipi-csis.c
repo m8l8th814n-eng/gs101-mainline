@@ -121,7 +121,14 @@ MODULE_PARM_DESC(ebuf_bypass, "bypass the CSIS elastic buffer (default 1; 0 = pr
  * 0x1c) write densely. 0x04 decodes as MIPI RAW10 (V4L2 SRGGB10P: 4 pixels
  * in 5 bytes, LSB byte last), which is what we expose.
  */
-static unsigned int gs101_csis_dma_fmt = 0x04;
+/*
+ * 2026-09-21: default 6 = U10BIT_UNPACK_MSB_ZERO (pablo is-hw-csi-v5_4.h),
+ * 16 bits per pixel, 10-bit value LSB-aligned = V4L2 SRGGB10. Replaces the
+ * dense 0x04 (U10BIT_PACK), which only packed all 4 pixels per group at
+ * 3280 px, and the rear's 0x1e (S14BIT_UNPACK_MSB_ZERO, also 16 bits per
+ * pixel but signed 14-bit) that the buf_finish repack mis-modelled.
+ */
+static unsigned int gs101_csis_dma_fmt = 6;
 module_param_named(dma_fmt, gs101_csis_dma_fmt, uint, 0644);
 MODULE_PARM_DESC(dma_fmt, "raw value for the WDMA channel FMT register (default 6)");
 
@@ -144,9 +151,9 @@ MODULE_PARM_DESC(dma_ctx, "force WDMA context 0..3 for every instance (default 0
  * pablo sets only ABORT_CTRL_EN (bit1) = 0x2; the stock HAL builds its
  * ebuf0_ctrl_en from the constant 0x2c (csi_context.cc, decomp 2026-09-19).
  */
-static unsigned int gs101_csis_ebuf_ctrl_en = 0x2;
+static unsigned int gs101_csis_ebuf_ctrl_en = 0x2c;	/* stock HAL value; pablo's manual mode was 0x2 */
 module_param_named(ebuf_ctrl_en, gs101_csis_ebuf_ctrl_en, uint, 0644);
-MODULE_PARM_DESC(ebuf_ctrl_en, "raw EBUFn_CTRL_EN value (default 0x2, HAL uses 0x2c)");
+MODULE_PARM_DESC(ebuf_ctrl_en, "raw EBUFn_CTRL_EN value (default 0x2c = HAL; pablo manual mode 0x2)");
 
 /*
  * SYSREG_CSIS routing slot (EBUF channel) to use; -1 = the instance's WDMA
@@ -171,6 +178,11 @@ MODULE_PARM_DESC(wdma_fmt, "override DT google,wdma-fmt (-1 = DT, 0 = use dma_fm
 static bool gs101_csis_dma_input_prl;
 module_param_named(dma_input_prl, gs101_csis_dma_input_prl, bool, 0644);
 MODULE_PARM_DESC(dma_input_prl, "WDMA ch0 input path 1 = parallel, 0 = OTF (default)");
+
+/* 0 = hand 0x1e buffers to userspace untouched, to capture the raw layout. */
+static bool gs101_csis_repack_1e = true;
+module_param_named(repack_1e, gs101_csis_repack_1e, bool, 0644);
+MODULE_PARM_DESC(repack_1e, "repack WDMA FMT 0x1e to SRGGB10P in buf_finish (default 1)");
 
 struct gs101_csis {
 	struct device		*dev;
@@ -248,6 +260,7 @@ struct gs101_csis {
 
 	/* MIPI CSI-2 data lanes for this instance (imx355=4, imx386=2). */
 	unsigned int			lanes;
+	bool				cphy;		/* endpoint bus-type C-PHY (GN1) */
 
 	/* Sensor link frequency (DDR clock) from the DT endpoint, for the PHY. */
 	s64				link_freq;
@@ -464,16 +477,36 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 			&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_OUT_SYNC_CTRL + 6 * ch];
 		const struct is_reg *r_size =
 			&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_CHID0_SIZE + 6 * ch];
+		const struct is_reg *r_size1 =
+			&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_CHID1_SIZE + 6 * ch];
+		const struct is_reg *r_fake =
+			&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_GEN_FAKE_SIGNAL + 6 * ch];
+		const struct is_reg *r_level =
+			&csi_ebuf_regs[CSIS_EBUF_R_EBUF0_BUFFER_LEVEL_THRESHOLD + ch];
 
 		is_hw_set_field(eb, r_size,
 				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_CHIDX_SIZE_V], h);
 		is_hw_set_field(eb, r_size,
 				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_CHIDX_SIZE_H], w / 4);
+		/* VC1 size: no second virtual channel on either sensor (HAL/pablo write it). */
+		is_hw_set_field(eb, r_size1,
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_CHIDX_SIZE_V], 0);
+		is_hw_set_field(eb, r_size1,
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_CHIDX_SIZE_H], 0);
 		is_hw_set_field(eb, &csi_ebuf_regs[CSIS_EBUF_R_EBUF_CTRL],
 				&csi_ebuf_fields[CSIS_EBUF_F_EBUF_BYPASS], 0);
 		is_hw_set_reg(eb, r_ctrl_en, gs101_csis_ebuf_ctrl_en);
 		is_hw_set_field(eb, r_sync,
 				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_OUT_MIN_HBLANK], 0x10);
+		/*
+		 * Stock HAL order after ctrl_en and out_sync: buffer level
+		 * threshold (HAL default 2, property ebuf_level_threshold_0), then
+		 * a fake-signal kick. Neither is written by pablo on gs101 (no mcb
+		 * resource, so its EBUF block is skipped). 2026-09-20.
+		 */
+		is_hw_set_reg(eb, r_level, 2);
+		is_hw_set_field(eb, r_fake,
+				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_GEN_FAKE_SIGNAL], 1);
 #if 0	/* pablo's two field writes, replaced by the raw ebuf_ctrl_en parameter */
 		is_hw_set_field(eb, r_ctrl_en,
 				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_ABORT_CTRL_EN], 1);
@@ -492,6 +525,9 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 	/* LANE_NUMBER = lanes - 1; enable one data-lane bit per lane. */
 	is_hw_set_field(link, &csi_regs[CSIS_R_CSIS_CMN_CTRL],
 			&csi_fields[CSIS_F_LANE_NUMBER], csis->lanes - 1);
+	/* PHY_SEL: 1 = C-PHY (pablo csi_hw_enable). */
+	is_hw_set_field(link, &csi_regs[CSIS_R_CSIS_CMN_CTRL],
+			&csi_fields[CSIS_F_PHY_SEL], csis->cphy ? 1 : 0);
 	is_hw_set_field(link, &csi_regs[CSIS_R_PHY_CMN_CTRL],
 			&csi_fields[CSIS_F_ENABLE_DAT],
 			(1 << csis->lanes) - 1);
@@ -540,9 +576,28 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 
 	/* WDMA VC0: 2D, RAW10 unpacked to 16-bit, resolution, stride. */
 	val = gs101_csis_wdma_fmt >= 0 ? (u32)gs101_csis_wdma_fmt : csis->wdma_fmt;
+#if 0	/*
+	 * 2026-09-21: U8BIT_PACK for the 8-bit format gave no DMA completions
+	 * (link FRM_CNT ran, DMA INT_SRC stayed 0, motion watchdog). pablo
+	 * selects U8BIT_PACK only for RAW8 link data (is-hw-csi-v5_4.c:300);
+	 * a RAW10 sensor always gets U10BIT_*. The 8-bit format is now the
+	 * instance's normal 10-bit DMA layout converted in buf_finish.
+	 */
+	if (csis->pixfmt.pixelformat == V4L2_PIX_FMT_SBGGR8) {
+		/* 8-bit Bayer selected with S_FMT (motion): 1 byte per pixel. */
+		val = is_hw_get_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT]);
+		val = is_hw_set_field_value(val,
+					    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_DIM],
+					    CSIS_REG_DMA_2D_DMA);
+		val = is_hw_set_field_value(val,
+					    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_DATAFORMAT],
+					    CSIS_DMA_FMT_U8BIT_PACK);
+		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT], val);
+	} else
+#endif
 	if (val) {
 		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT], val);
-	} else if (gs101_csis_dma_fmt != 6) {	/* default 0x04 = SRGGB10P, see the parameter */
+	} else if (gs101_csis_dma_fmt != 6) {	/* raw override (0x04 = SRGGB10P); default is 6 below */
 		/* raw override, see the dma_fmt parameter */
 		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT],
 			      gs101_csis_dma_fmt);
@@ -564,7 +619,8 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 
 	is_hw_set_field(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_STRIDE],
 			&csi_dmax_chx_fields[CSIS_DMAX_CHX_F_STRIDE],
-			csis->pixfmt.bytesperline);
+			csis->pixfmt.pixelformat == V4L2_PIX_FMT_SBGGR8 ?
+			w * 2 : csis->pixfmt.bytesperline);	/* 8-bit: DMA still writes 10-bit lines */
 
 	gs101_csis_hw_set_dma_addr(csis, addr);
 
@@ -780,6 +836,13 @@ static u32 gs101_csis_effective_wdma_fmt(struct gs101_csis *csis)
 	return val ? val : gs101_csis_dma_fmt;
 }
 
+/* V4L2 pixel format matching the WDMA layout: 16-bit unpacked for FMT 6. */
+static u32 gs101_csis_pixelformat(struct gs101_csis *csis)
+{
+	return gs101_csis_effective_wdma_fmt(csis) == 6 ?
+	       V4L2_PIX_FMT_SRGGB10 : V4L2_PIX_FMT_SRGGB10P;
+}
+
 /*
  * WDMA FMT 0x1e writes 4 pixels per 8 bytes: 4 MSB bytes, 1 LSB byte, 3 pad.
  * Compact each line in place to the 5-byte groups of V4L2 SRGGB10P at the
@@ -797,9 +860,40 @@ static void gs101_csis_buf_finish(struct vb2_buffer *vb)
 	u8 *base;
 	u32 y, g;
 
-	if (gs101_csis_effective_wdma_fmt(csis) != 0x1e)
-		return;
 	if (vb->state != VB2_BUF_STATE_DONE)
+		return;
+
+	/*
+	 * 8-bit format (motion): the DMA wrote the instance's 10-bit layout
+	 * with a width*2 stride; keep the 8 MSBs of every pixel, packed at the
+	 * start of the buffer. Destination never passes source.
+	 */
+	if (csis->pixfmt.pixelformat == V4L2_PIX_FMT_SBGGR8) {
+		u32 x;
+
+		base = vb2_plane_vaddr(vb, 0);
+		if (!base)
+			return;
+		for (y = 0; y < h; y++) {
+			u8 *dst = base + (size_t)y * w;
+			u8 *src = base + (size_t)y * w * 2;
+
+			if (gs101_csis_effective_wdma_fmt(csis) == 6) {
+				const u16 *px = (const u16 *)src;	/* 10-bit LSB-aligned */
+
+				for (x = 0; x < w; x++)
+					dst[x] = px[x] >> 2;
+			} else {	/* 0x04: 4 px in 5 bytes, MSBs first */
+				for (g = 0; g < groups; g++)
+					memmove(dst + g * 4, src + g * 5, 4);
+			}
+		}
+		vb2_set_plane_payload(vb, 0, (size_t)w * h);
+		return;
+	}
+
+	if (!gs101_csis_repack_1e ||
+	    gs101_csis_effective_wdma_fmt(csis) != 0x1e)
 		return;
 	if (stride < w * 2)
 		return;
@@ -1227,6 +1321,8 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 		/* Configure the D-PHY analog/settle for reception (VC0, RAW10). */
 		opts.mipi_dphy.lanes = csis->lanes;
 		opts.mipi_dphy.hs_clk_rate = csis->link_freq * 2;
+		/* submode 1 = C-PHY sequence in phy-exynos-mipi-gs101.c */
+		phy_set_mode_ext(csis->phys[0], PHY_MODE_MIPI_DPHY, csis->cphy ? 1 : 0);
 		ret = phy_configure(csis->phys[0], &opts);
 		if (ret) {
 			phy_power_off(csis->phys[0]);
@@ -1393,7 +1489,8 @@ static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 {
 	u32 w, h;
 
-	pf->pixelformat = V4L2_PIX_FMT_SRGGB10P;	/* native RGGB, see gs101_csis_init_state */
+	if (pf->pixelformat != V4L2_PIX_FMT_SBGGR8)	/* 8-bit kept when asked for (motion) */
+		pf->pixelformat = gs101_csis_pixelformat(csis);	/* native RGGB, see gs101_csis_init_state */
 	pf->field = V4L2_FIELD_NONE;
 	pf->colorspace = V4L2_COLORSPACE_RAW;
 	/*
@@ -1424,8 +1521,22 @@ static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 	 * stride that covers the packed line and is a 64-byte multiple; keep
 	 * width*2 otherwise. (This instance's 0x1e layout, if set, needs
 	 * exactly width*2: 4 px per 8 bytes.)
+	 * 2026-09-20: key this on the effective WDMA format, not only the DT
+	 * value: with the wdma_fmt parameter forcing 0x1e on the front, the
+	 * DT value is still 0 and a 5/4 stride (1792 for 1280 px) was kept for
+	 * 2-byte-per-pixel data, so lines overlapped. Only 0x04 packs 5/4.
 	 */
-	if (!csis->wdma_fmt && pf->bytesperline >= pf->width * 5 / 4 &&
+	if (pf->pixelformat == V4L2_PIX_FMT_SBGGR8) {
+		/*
+		 * 1 byte per pixel for the reader; the buffer still holds the
+		 * 10-bit DMA frame (width*2 per line), converted in buf_finish.
+		 */
+		pf->bytesperline = pf->width;
+		pf->sizeimage = pf->width * 2 * pf->height;
+		return;
+	}
+	if (gs101_csis_effective_wdma_fmt(csis) == 0x04 &&
+	    pf->bytesperline >= pf->width * 5 / 4 &&
 	    !(pf->bytesperline % 64))
 		;	/* keep the caller's stride */
 	else
@@ -1443,7 +1554,8 @@ static int gs101_csis_enum_framesizes(struct file *file, void *priv,
 {
 	if (fsize->index)
 		return -EINVAL;
-	if (fsize->pixel_format != V4L2_PIX_FMT_SRGGB10P)
+	if (fsize->pixel_format != gs101_csis_pixelformat(video_drvdata(file)) &&
+	    fsize->pixel_format != V4L2_PIX_FMT_SBGGR8)
 		return -EINVAL;
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	gs101_csis_link_size(video_drvdata(file), &fsize->discrete.width,
@@ -1472,6 +1584,17 @@ static int gs101_csis_querycap(struct file *file, void *priv,
 static int gs101_csis_enum_fmt(struct file *file, void *priv,
 			       struct v4l2_fmtdesc *f)
 {
+	/*
+	 * Index 1: 8-bit Bayer (10-bit DMA frame, 8 MSBs kept in buf_finish) for plain V4L2 users such as
+	 * motion. Not listed under a media bus code, so libcamera (which
+	 * enumerates with one) keeps seeing only index 0. Labelled SBGGR8
+	 * because motion 4.x accepts only BGGR/GBRG/GRBG 8-bit (RGGB was
+	 * listed but rejected, 2026-09-21); the data is the sensor's RGGB.
+	 */
+	if (f->index == 1 && !f->mbus_code) {
+		f->pixelformat = V4L2_PIX_FMT_SBGGR8;
+		return 0;
+	}
 	if (f->index)
 		return -EINVAL;
 	/*
@@ -1483,7 +1606,7 @@ static int gs101_csis_enum_fmt(struct file *file, void *priv,
 	 */
 	if (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SRGGB10_1X10)
 		return -EINVAL;
-	f->pixelformat = V4L2_PIX_FMT_SRGGB10P;
+	f->pixelformat = gs101_csis_pixelformat(video_drvdata(file));
 	return 0;
 }
 
@@ -1693,7 +1816,7 @@ static const struct v4l2_async_notifier_operations gs101_csis_notify_ops = {
 
 static int gs101_csis_parse_dt(struct gs101_csis *csis)
 {
-	struct v4l2_fwnode_endpoint vep = { .bus_type = V4L2_MBUS_CSI2_DPHY };
+	struct v4l2_fwnode_endpoint vep = { .bus_type = V4L2_MBUS_UNKNOWN };
 	struct fwnode_handle *ep;
 	struct v4l2_async_connection *asc;
 	int ret;
@@ -1715,6 +1838,8 @@ static int gs101_csis_parse_dt(struct gs101_csis *csis)
 		csis->lanes = vep.bus.mipi_csi2.num_data_lanes;
 	else
 		csis->lanes = 4;
+	/* bus-type = <3> (C-PHY, 3 trios): the GN1 rear main camera (2026-09-21). */
+	csis->cphy = vep.bus_type == V4L2_MBUS_CSI2_CPHY;
 
 	/* Sensor link (DDR) frequency for the D-PHY config; default 360 MHz. */
 	if (fwnode_property_read_u64_array(ep, "link-frequencies",

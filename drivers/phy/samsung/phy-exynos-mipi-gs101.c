@@ -78,6 +78,7 @@ struct exynos_mipi_phy {
 		unsigned int iso_offset;
 		unsigned int rst_bit;
 		void __iomem *regs;
+		bool cphy;		/* set_mode submode 1: C-PHY (rear main GN1) */
 	} phys[EXYNOS_MIPI_PHYS_NUM];
 };
 
@@ -1119,6 +1120,67 @@ static int gs101_dcphy_hal_dphy_set(void __iomem *regs, unsigned int lanes,
 	return 0;
 }
 
+/*
+ * Stock HAL C-PHY branch of the same routine (csi_context.cc, param_5 & 1):
+ * settle 7 (>= 1000 Msps) or 9, bias CON4 = 0x40, no clock lane, one block
+ * per trio. Replayed from userspace on DCPHY0/link0 with the GN1 streaming
+ * (2026-09-21): FRM_CNT runs and the WDMA delivers 2016x1136 at 117 fps.
+ */
+static int gs101_dcphy_hal_cphy_set(void __iomem *regs, unsigned int lanes,
+				    u32 rate_msps)
+{
+	void __iomem *bias;
+	u32 settle = (rate_msps < 1000) ? 9 : 7;
+	u32 settle_clk_sel = (rate_msps < 500) ? BIT(8) : 0;
+	unsigned int i;
+
+	bias = ioremap(0x1A4F1000, 0x1000);
+	if (!bias)
+		return -ENOMEM;
+	writel(0x00000010, bias + 0x0000);	/* M_BIAS_CON0 */
+	writel(0x00000110, bias + 0x0004);	/* M_BIAS_CON1 */
+	writel(0x00003223, bias + 0x0008);	/* M_BIAS_CON2 */
+	writel(0x00000000, bias + 0x000c);	/* M_BIAS_CON3 */
+	writel(0x00000040, bias + 0x0010);	/* M_BIAS_CON4 (C-PHY) */
+	iounmap(bias);
+
+	for (i = 0; i < lanes; i++) {
+		void __iomem *sd = regs + 0x0100 + i * 0x100;
+		u32 val;
+
+		writel(0x00000001, sd + 0x0000);	/* SD_GNR_CON0 = enable */
+		writel(0x00001450, sd + 0x0004);	/* SD_GNR_CON1 */
+		writel(0x00000009, sd + 0x0008);	/* SD_ANA_CON0 */
+		writel(0x000082b8, sd + 0x000c);	/* SD_ANA_CON1 */
+		writel(0x00000001, sd + 0x0010);	/* SD_ANA_CON2 */
+		writel(0x00008600, sd + 0x0014);	/* SD_ANA_CON3 */
+		writel(0x00004000, sd + 0x0018);	/* SD_ANA_CON4 */
+		writel(0x00000200, sd + 0x001c);	/* SD_ANA_CON5 */
+		writel(0x00000638, sd + 0x0020);	/* SD_ANA_CON6 */
+		writel(0x00000040, sd + 0x0024);	/* SD_ANA_CON7 */
+		val = readl(sd + 0x0030) & ~0x1ffU;
+		writel(val | settle | settle_clk_sel, sd + 0x0030); /* SD_TIME_CON0 */
+		writel(0x00000032, sd + 0x0034);	/* SD_TIME_CON1 */
+		writel(0x00001503, sd + 0x0064);	/* +0x64 */
+		writel(0x00000032, sd + 0x0068);	/* +0x68 */
+	}
+
+	pr_info("%s: %u trios, %u Msps -> settle %u clk_sel %u\n",
+		__func__, lanes, rate_msps, settle, !!settle_clk_sel);
+	return 0;
+}
+
+static int exynos_mipi_phy_set_mode(struct phy *phy, enum phy_mode mode,
+				    int submode)
+{
+	struct mipi_phy_desc *phy_desc = phy_get_drvdata(phy);
+
+	if (mode != PHY_MODE_MIPI_DPHY)
+		return -EINVAL;
+	phy_desc->cphy = submode == 1;
+	return 0;
+}
+
 static int exynos_mipi_phy_configure(struct phy *phy,
 				     union phy_configure_opts *opts)
 {
@@ -1196,7 +1258,10 @@ static int exynos_mipi_phy_configure(struct phy *phy,
 	 * same; proven from userspace on the link the front sensor actually
 	 * lands on (DCPHY4/link4, see gs101-pixel-common.dtsi).
 	 */
-	ret = gs101_dcphy_hal_dphy_set(phy_desc->regs, lanes, speed_mbps);
+	if (phy_desc->cphy)
+		ret = gs101_dcphy_hal_cphy_set(phy_desc->regs, lanes, speed_mbps);
+	else
+		ret = gs101_dcphy_hal_dphy_set(phy_desc->regs, lanes, speed_mbps);
 #if 0	/* TEST (f): gnr_con0 only -- gives an idle PHY (STOPSTATE), superseded */
 	writel(0x00000001, phy_desc->regs + 0x0000);	/* SC_GNR_CON0 = enable */
 	ret = 0;
@@ -1213,6 +1278,7 @@ static struct phy_ops exynos_mipi_phy_ops = {
 	.power_on	= exynos_mipi_phy_power_on,
 	.power_off	= exynos_mipi_phy_power_off,
 	.configure	= exynos_mipi_phy_configure,
+	.set_mode	= exynos_mipi_phy_set_mode,
 	.owner		= THIS_MODULE,
 };
 
