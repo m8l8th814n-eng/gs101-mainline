@@ -81,6 +81,17 @@
 #define GS101_CSIS_VC0			0
 #define GS101_CSIS_DT_RAW10		0x2b
 
+/*
+ * The 8-bit Bayer format (motion): SBGGR8 or, for an instance whose frame
+ * starts with an odd number of non-image lines, SGBRG8. See
+ * gs101_csis_pixelformat8().
+ */
+static bool gs101_csis_is_8bit(u32 pixelformat)
+{
+	return pixelformat == V4L2_PIX_FMT_SBGGR8 ||
+	       pixelformat == V4L2_PIX_FMT_SGBRG8;
+}
+
 /* Number of MIPI D/C-PHYs / CSIS links on gs101. */
 #define GS101_CSIS_NUM_PHYS	8
 
@@ -134,6 +145,22 @@ MODULE_PARM_DESC(dma_fmt, "raw value for the WDMA channel FMT register (default 
 
 static unsigned int gs101_csis_pixel_mode = 2;	/* 2026-09-19: QUAD = 3/3 captures, single = link overflow */
 module_param_named(pixel_mode, gs101_csis_pixel_mode, uint, 0644);
+
+/*
+ * ACPM CAM DVFS vote (kHz) at stream start: stock LWIS floor 67000 for the
+ * D-PHY cameras. The GN1 C-PHY link (3 trios, 1596 Msps) overflowed the link
+ * FIFO at 67 MHz (INT_SRC0 ERR_OVER, zero frames, 2026-09-21): the CSIS bus
+ * is dout_cmu_csis_bus = 399.36 MHz / 6 at that level.
+ */
+/*
+ * 2026-09-21 evening: at 67 MHz the front's 1280x720@120 stream overflowed
+ * the link (INT_SRC0 ERR_OVER) and plasma-camera showed black; at 400 MHz
+ * (set at runtime) the picture came back. 400 MHz is now the default.
+ */
+static unsigned int gs101_csis_cam_dvfs_khz = 400000;
+module_param_named(cam_dvfs_khz, gs101_csis_cam_dvfs_khz, uint, 0644);
+static unsigned int gs101_csis_cam_dvfs_cphy_khz = 400000;
+module_param_named(cam_dvfs_cphy_khz, gs101_csis_cam_dvfs_cphy_khz, uint, 0644);
 MODULE_PARM_DESC(pixel_mode, "link ISP_CONFIG PIXEL_MODE: 0 single, 1 dual, 2 quad (default 2)");
 
 /*
@@ -142,8 +169,35 @@ MODULE_PARM_DESC(pixel_mode, "link ISP_CONFIG PIXEL_MODE: 0 single, 1 dual, 2 qu
  * context 0 captures; running the rear on context 0 tells whether it is the
  * context (its AXI port) or the link. Only one instance may stream while set.
  */
-static int gs101_csis_dma_ctx;	/* 2026-09-19: rear on ctx0 captures, on ctx1 all zeros -> 0 for now */
+/*
+ * 2026-09-19: rear on ctx0 captured, on ctx1 all zeros -> forced 0.
+ * 2026-09-22: with the SYSREG routing in place the rear captures on ctx1
+ * and front + rear stream simultaneously on ctx0/ctx1; forcing every
+ * instance to ctx0 made three cameras fight over one context (motion).
+ * -1 = use the DT google,csis-dma-vc.
+ */
+static int gs101_csis_dma_ctx = -1;
 module_param_named(dma_ctx, gs101_csis_dma_ctx, int, 0644);
+/*
+ * dma_hal_cfg=1: program the WDMA channel the way the stock HAL does
+ * (csi_wdma.cc, RE 2026-09-21): RESOL.VRESOL = 0, SKIP_EN with skip_seq
+ * 0x7FFFFFFF (one valid frame slot), CTRL.UPDT_SKIPPTR = 0x1f. Default 0
+ * keeps the pablo-style setup (VRESOL = height, no skip control).
+ */
+static bool gs101_csis_dma_hal_cfg;
+/*
+ * DBG_OPTION_SUITE.DBG_PIXEL_ALIGN_EN (link 0x690 bit 23). The stock HAL sets
+ * it (csi_context.cc); pablo never touches it. Without it the WDMA gets only
+ * two of the four pixels of every quad-mode word (px2/px3 zero in RG10, LSB
+ * byte zero in packed RAW10); with it the front captures a clean full image
+ * (proven live 2026-09-22 on the imx355 at 1280x720 and the same defect on
+ * every other mode/sensor). Default on; pixel_align=0 restores the old path.
+ */
+static bool gs101_csis_pixel_align = true;
+module_param_named(pixel_align, gs101_csis_pixel_align, bool, 0644);
+MODULE_PARM_DESC(pixel_align, "link DBG_OPTION_SUITE PIXEL_ALIGN_EN (default 1; stock HAL value)");
+module_param_named(dma_hal_cfg, gs101_csis_dma_hal_cfg, bool, 0644);
+MODULE_PARM_DESC(dma_hal_cfg, "WDMA channel: 1 = stock HAL recipe (VRESOL 0, SKIP_EN, UPDT_SKIPPTR 0x1f)");
 MODULE_PARM_DESC(dma_ctx, "force WDMA context 0..3 for every instance (default 0; -1 = DT)");
 
 /*
@@ -153,6 +207,20 @@ MODULE_PARM_DESC(dma_ctx, "force WDMA context 0..3 for every instance (default 0
  */
 static unsigned int gs101_csis_ebuf_ctrl_en = 0x2c;	/* stock HAL value; pablo's manual mode was 0x2 */
 module_param_named(ebuf_ctrl_en, gs101_csis_ebuf_ctrl_en, uint, 0644);
+/*
+ * Stock HAL EBUF values (csi_context.cc, field setters at liblyric 0xba9770..,
+ * decoded 2026-09-21): out_sync_ctrl = 0x1 (bit0 = 1, bit1 = 0),
+ * buffer_level_threshold = level0 | level1 << 4 (properties, defaults 2 and
+ * 4 -> 0x42), gen_fake_signal = 0, num_of_cameras written (value seen: 2).
+ */
+static unsigned int gs101_csis_ebuf_out_sync = 0x1;
+module_param_named(ebuf_out_sync, gs101_csis_ebuf_out_sync, uint, 0644);
+static unsigned int gs101_csis_ebuf_level = 0x42;
+module_param_named(ebuf_level, gs101_csis_ebuf_level, uint, 0644);
+static unsigned int gs101_csis_ebuf_fake = 0;
+module_param_named(ebuf_fake, gs101_csis_ebuf_fake, uint, 0644);
+static unsigned int gs101_csis_ebuf_num_cameras = 1;
+module_param_named(ebuf_num_cameras, gs101_csis_ebuf_num_cameras, uint, 0644);
 MODULE_PARM_DESC(ebuf_ctrl_en, "raw EBUFn_CTRL_EN value (default 0x2c = HAL; pablo manual mode 0x2)");
 
 /*
@@ -208,6 +276,17 @@ struct gs101_csis {
 	/* Per-instance default capture size from DT; falls back to GS101_CSIS_DEF_*. */
 	u32			def_width;
 	u32			def_height;
+	/*
+	 * DT "google,leading-lines": non-image lines the sensor sends before
+	 * the image on VC0 (imx355: one embedded-data line, DT 0x12). The
+	 * link routes by virtual channel only, so the WDMA writes that line
+	 * as buffer line 0 and the image starts one line down. An odd count
+	 * shifts the Bayer phase by one row: sensor RGGB -> GBRG in memory
+	 * (proven with the imx355 colour-bar test pattern, 2026-09-22). The
+	 * exposed pixel formats follow that shift; the last image line is
+	 * lost. 0 = no shift.
+	 */
+	u32			leading_lines;
 	/*
 	 * Scratch frame the WDMA writes into while userspace has no buffer
 	 * queued. The channel is never disabled mid-stream: disabling it and
@@ -496,17 +575,19 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 		is_hw_set_field(eb, &csi_ebuf_regs[CSIS_EBUF_R_EBUF_CTRL],
 				&csi_ebuf_fields[CSIS_EBUF_F_EBUF_BYPASS], 0);
 		is_hw_set_reg(eb, r_ctrl_en, gs101_csis_ebuf_ctrl_en);
-		is_hw_set_field(eb, r_sync,
-				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_OUT_MIN_HBLANK], 0x10);
+		/* 2026-09-21: raw HAL values via parameters (were 0x10 / 2 / 1). */
+		is_hw_set_reg(eb, r_sync, gs101_csis_ebuf_out_sync);
+		is_hw_set_field(eb, &csi_ebuf_regs[CSIS_EBUF_R_EBUF_NUM_OF_CAMERAS],
+				&csi_ebuf_fields[CSIS_EBUF_F_NUM_OF_CAMERAS],
+				gs101_csis_ebuf_num_cameras);
 		/*
 		 * Stock HAL order after ctrl_en and out_sync: buffer level
 		 * threshold (HAL default 2, property ebuf_level_threshold_0), then
 		 * a fake-signal kick. Neither is written by pablo on gs101 (no mcb
 		 * resource, so its EBUF block is skipped). 2026-09-20.
 		 */
-		is_hw_set_reg(eb, r_level, 2);
-		is_hw_set_field(eb, r_fake,
-				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_GEN_FAKE_SIGNAL], 1);
+		is_hw_set_reg(eb, r_level, gs101_csis_ebuf_level);
+		is_hw_set_reg(eb, r_fake, gs101_csis_ebuf_fake);
 #if 0	/* pablo's two field writes, replaced by the raw ebuf_ctrl_en parameter */
 		is_hw_set_field(eb, r_ctrl_en,
 				&csi_ebuf_fields[CSIS_EBUF_F_EBUFX_ABORT_CTRL_EN], 1);
@@ -528,6 +609,10 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 	/* PHY_SEL: 1 = C-PHY (pablo csi_hw_enable). */
 	is_hw_set_field(link, &csi_regs[CSIS_R_CSIS_CMN_CTRL],
 			&csi_fields[CSIS_F_PHY_SEL], csis->cphy ? 1 : 0);
+	/* Pixel alignment of the OTF output towards the WDMA, see pixel_align. */
+	is_hw_set_field(link, &csi_regs[CSIS_R_DBG_OPTION_SUITE],
+			&csi_fields[CSIS_F_DBG_PIXEL_ALIGN_EN],
+			gs101_csis_pixel_align ? 1 : 0);
 	is_hw_set_field(link, &csi_regs[CSIS_R_PHY_CMN_CTRL],
 			&csi_fields[CSIS_F_ENABLE_DAT],
 			(1 << csis->lanes) - 1);
@@ -583,7 +668,7 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 	 * a RAW10 sensor always gets U10BIT_*. The 8-bit format is now the
 	 * instance's normal 10-bit DMA layout converted in buf_finish.
 	 */
-	if (csis->pixfmt.pixelformat == V4L2_PIX_FMT_SBGGR8) {
+	if (gs101_csis_is_8bit(csis->pixfmt.pixelformat)) {
 		/* 8-bit Bayer selected with S_FMT (motion): 1 byte per pixel. */
 		val = is_hw_get_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_FMT]);
 		val = is_hw_set_field_value(val,
@@ -614,12 +699,20 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 
 	val = is_hw_get_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_RESOL]);
 	val = is_hw_set_field_value(val, &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_HRESOL], w);
-	val = is_hw_set_field_value(val, &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_VRESOL], h);
+	val = is_hw_set_field_value(val, &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_VRESOL],
+				    gs101_csis_dma_hal_cfg ? 0 : h);
 	is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_RESOL], val);
+
+	if (gs101_csis_dma_hal_cfg) {
+		/* HAL: SKIP_EN, skip_seq = bitrev(~valid_mask) for one slot. */
+		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_SKIP], BIT(31));
+		is_hw_set_reg(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_SKIP_SEQ],
+			      0x7fffffff);
+	}
 
 	is_hw_set_field(vc0, &csi_dmax_chx_regs[CSIS_DMAX_CHX_R_STRIDE],
 			&csi_dmax_chx_fields[CSIS_DMAX_CHX_F_STRIDE],
-			csis->pixfmt.pixelformat == V4L2_PIX_FMT_SBGGR8 ?
+			gs101_csis_is_8bit(csis->pixfmt.pixelformat) ?
 			w * 2 : csis->pixfmt.bytesperline);	/* 8-bit: DMA still writes 10-bit lines */
 
 	gs101_csis_hw_set_dma_addr(csis, addr);
@@ -636,6 +729,10 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 				    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_UPDT_PTR_EN], 1);
 	val = is_hw_set_field_value(val,
 				    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_UPDT_FRAMEPTR], 0);
+	if (gs101_csis_dma_hal_cfg)	/* HAL ctrl 0xF83: UPDT_SKIPPTR = 0x1f */
+		val = is_hw_set_field_value(val,
+					    &csi_dmax_chx_fields[CSIS_DMAX_CHX_F_UPDT_SKIPPTR],
+					    0x1f);
 	/*
 	 * DMA_ENABLE stays 0 here. 2026-09-19: with identical settings some
 	 * streams captured and some died from the first frame (OTF OVERLAP +
@@ -836,11 +933,30 @@ static u32 gs101_csis_effective_wdma_fmt(struct gs101_csis *csis)
 	return val ? val : gs101_csis_dma_fmt;
 }
 
-/* V4L2 pixel format matching the WDMA layout: 16-bit unpacked for FMT 6. */
+/*
+ * V4L2 pixel format matching the WDMA layout: 16-bit unpacked for FMT 6.
+ * Bayer order: the sensor's RGGB, shifted one row (GBRG) when an odd number
+ * of leading non-image lines precedes the image (see leading_lines).
+ */
 static u32 gs101_csis_pixelformat(struct gs101_csis *csis)
 {
-	return gs101_csis_effective_wdma_fmt(csis) == 6 ?
-	       V4L2_PIX_FMT_SRGGB10 : V4L2_PIX_FMT_SRGGB10P;
+	bool unpacked = gs101_csis_effective_wdma_fmt(csis) == 6;
+
+	if (csis->leading_lines & 1)
+		return unpacked ? V4L2_PIX_FMT_SGBRG10 : V4L2_PIX_FMT_SGBRG10P;
+	return unpacked ? V4L2_PIX_FMT_SRGGB10 : V4L2_PIX_FMT_SRGGB10P;
+}
+
+/*
+ * 8-bit format for plain V4L2 users (motion). Motion 4.x accepts only
+ * BGGR/GBRG/GRBG 8-bit, so an unshifted instance is labelled SBGGR8 although
+ * its data is RGGB (R/B swapped for motion); a row-shifted instance is
+ * labelled with its true order, SGBRG8.
+ */
+static u32 gs101_csis_pixelformat8(struct gs101_csis *csis)
+{
+	return (csis->leading_lines & 1) ? V4L2_PIX_FMT_SGBRG8 :
+					   V4L2_PIX_FMT_SBGGR8;
 }
 
 /*
@@ -868,7 +984,7 @@ static void gs101_csis_buf_finish(struct vb2_buffer *vb)
 	 * with a width*2 stride; keep the 8 MSBs of every pixel, packed at the
 	 * start of the buffer. Destination never passes source.
 	 */
-	if (csis->pixfmt.pixelformat == V4L2_PIX_FMT_SBGGR8) {
+	if (gs101_csis_is_8bit(csis->pixfmt.pixelformat)) {
 		u32 x;
 
 		base = vb2_plane_vaddr(vb, 0);
@@ -1150,9 +1266,12 @@ static int gs101_csis_start_streaming(struct vb2_queue *q, unsigned int count)
 	 * no-op today; it keeps the vote explicit and lets us raise it later.
 	 */
 	if (csis->cam_dvfs) {
-		ret = clk_set_rate(csis->cam_dvfs, 67000000);
-		dev_info(csis->dev, "cam dvfs: set 67 MHz ret=%d now %lu Hz\n",
-			 ret, clk_get_rate(csis->cam_dvfs));
+		unsigned long khz = csis->cphy ? gs101_csis_cam_dvfs_cphy_khz :
+						 gs101_csis_cam_dvfs_khz;
+
+		ret = clk_set_rate(csis->cam_dvfs, khz * 1000);
+		dev_info(csis->dev, "cam dvfs: set %lu kHz ret=%d now %lu Hz\n",
+			 khz, ret, clk_get_rate(csis->cam_dvfs));
 		ret = 0;
 	}
 
@@ -1484,13 +1603,51 @@ static void gs101_csis_set_link_size(struct gs101_csis *csis, u32 w, u32 h)
 	v4l2_subdev_unlock_state(state);
 }
 
+/*
+ * Pure V4L2 users (motion, v4l2-ctl) only S_FMT the video node; libcamera
+ * sets the sensor's mode itself first. Push the requested size into the
+ * sensor's active format and take back what it chose (nearest mode), so the
+ * link and the WDMA are programmed for what the sensor really sends.
+ * 2026-09-22: without this the front stayed at its default 3280x2464 while
+ * the link expected 1640x1232 -> no DMA completion, motion watchdog.
+ */
+static void gs101_csis_set_sensor_size(struct gs101_csis *csis, u32 *w, u32 *h)
+{
+	struct v4l2_subdev_format fmt = {
+		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+		.pad = 0,
+		.format = {
+			.width = *w,
+			.height = *h,
+			.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+			.field = V4L2_FIELD_NONE,
+		},
+	};
+	int ret;
+
+	if (!csis->sensor_sd || !*w || !*h)
+		return;
+	ret = v4l2_subdev_call_state_active(csis->sensor_sd, pad, set_fmt, &fmt);
+	if (ret) {
+		dev_warn(csis->dev, "sensor set_fmt %ux%u failed: %d\n", *w, *h, ret);
+		return;
+	}
+	if (fmt.format.width != *w || fmt.format.height != *h)
+		dev_info(csis->dev, "sensor picked %ux%u for %ux%u\n",
+			 fmt.format.width, fmt.format.height, *w, *h);
+	*w = fmt.format.width;
+	*h = fmt.format.height;
+}
+
 static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 				  struct v4l2_pix_format *pf)
 {
 	u32 w, h;
 
-	if (pf->pixelformat != V4L2_PIX_FMT_SBGGR8)	/* 8-bit kept when asked for (motion) */
-		pf->pixelformat = gs101_csis_pixelformat(csis);	/* native RGGB, see gs101_csis_init_state */
+	if (!gs101_csis_is_8bit(pf->pixelformat))	/* 8-bit kept when asked for (motion) */
+		pf->pixelformat = gs101_csis_pixelformat(csis);	/* sensor RGGB, row-shifted if leading_lines is odd */
+	else
+		pf->pixelformat = gs101_csis_pixelformat8(csis);
 	pf->field = V4L2_FIELD_NONE;
 	pf->colorspace = V4L2_COLORSPACE_RAW;
 	/*
@@ -1526,7 +1683,7 @@ static void gs101_csis_set_pixfmt(struct gs101_csis *csis,
 	 * DT value is still 0 and a 5/4 stride (1792 for 1280 px) was kept for
 	 * 2-byte-per-pixel data, so lines overlapped. Only 0x04 packs 5/4.
 	 */
-	if (pf->pixelformat == V4L2_PIX_FMT_SBGGR8) {
+	if (gs101_csis_is_8bit(pf->pixelformat)) {
 		/*
 		 * 1 byte per pixel for the reader; the buffer still holds the
 		 * 10-bit DMA frame (width*2 per line), converted in buf_finish.
@@ -1555,7 +1712,7 @@ static int gs101_csis_enum_framesizes(struct file *file, void *priv,
 	if (fsize->index)
 		return -EINVAL;
 	if (fsize->pixel_format != gs101_csis_pixelformat(video_drvdata(file)) &&
-	    fsize->pixel_format != V4L2_PIX_FMT_SBGGR8)
+	    !gs101_csis_is_8bit(fsize->pixel_format))
 		return -EINVAL;
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	gs101_csis_link_size(video_drvdata(file), &fsize->discrete.width,
@@ -1590,9 +1747,11 @@ static int gs101_csis_enum_fmt(struct file *file, void *priv,
 	 * enumerates with one) keeps seeing only index 0. Labelled SBGGR8
 	 * because motion 4.x accepts only BGGR/GBRG/GRBG 8-bit (RGGB was
 	 * listed but rejected, 2026-09-21); the data is the sensor's RGGB.
+	 * A row-shifted instance (leading_lines odd) is labelled SGBRG8,
+	 * which is then its true order; see gs101_csis_pixelformat8().
 	 */
 	if (f->index == 1 && !f->mbus_code) {
-		f->pixelformat = V4L2_PIX_FMT_SBGGR8;
+		f->pixelformat = gs101_csis_pixelformat8(video_drvdata(file));
 		return 0;
 	}
 	if (f->index)
@@ -1635,6 +1794,8 @@ static int gs101_csis_s_fmt(struct file *file, void *priv,
 		return -EBUSY;
 
 	gs101_csis_set_pixfmt(csis, &f->fmt.pix);
+	gs101_csis_set_sensor_size(csis, &f->fmt.pix.width, &f->fmt.pix.height);
+	gs101_csis_set_pixfmt(csis, &f->fmt.pix);	/* stride/size for the sensor's choice */
 	csis->pixfmt = f->fmt.pix;
 	gs101_csis_set_link_size(csis, f->fmt.pix.width, f->fmt.pix.height);
 	return 0;
@@ -1948,6 +2109,9 @@ static int gs101_csis_probe(struct platform_device *pdev)
 	csis->def_height = GS101_CSIS_DEF_HEIGHT;
 	of_property_read_u32(dev->of_node, "google,def-width", &csis->def_width);
 	of_property_read_u32(dev->of_node, "google,def-height", &csis->def_height);
+	/* Leading non-image lines (embedded data) on VC0, see struct comment. */
+	of_property_read_u32(dev->of_node, "google,leading-lines",
+			     &csis->leading_lines);
 
 
 	/*

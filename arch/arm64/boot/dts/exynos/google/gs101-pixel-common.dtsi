@@ -301,7 +301,22 @@
 		 * input only; with the driver default 6 (RG10) every front
 		 * configuration was rejected ("No valid configuration found").
 		 */
-		google,wdma-fmt = <0x4>;
+		/*
+		 * 2026-09-22: 0x4 commented out (user decision, after the GBRG
+		 * build was verified with wdma_fmt=0). With DBG_PIXEL_ALIGN_EN
+		 * set, FMT 0x4 writes a dense LSB-first 10-bit bitstream, not
+		 * the CSI2P layout, so every SRGGB10P reader saw every other
+		 * pixel dead. The driver default 6 (16-bit unpacked, GB10 with
+		 * leading-lines) is what plasma-camera and motion now use.
+		 */
+		/* google,wdma-fmt = <0x4>; */
+		/*
+		 * imx355 sends one embedded-data line (DT 0x12) on VC0 before
+		 * the image; the link routes by VC only, so it lands as buffer
+		 * line 0 and shifts the Bayer phase one row (RGGB -> GBRG).
+		 * Proven with the sensor colour-bar test pattern 2026-09-22.
+		 */
+		google,leading-lines = <1>;
 		/*
 		 * SYSREG_CSIS: the WDMA input routing (stock HAL csi_context.cc:
 		 * 0x430 + slot*4 = link, 0x408 + ctx*4 = slot, 0x488 enable bit
