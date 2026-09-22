@@ -2157,7 +2157,7 @@
 		compatible = "sony,imx386";
 		/* Rear ultra-wide: libcamera Location = back. */
 		orientation = <1>;
-		rotation = <90>;	/* user-observed after the 0x1e repack (2026-09-20) */
+		rotation = <270>;	/* user-observed in plasma-camera with FMT 6 + pixel align (2026-09-22); was 90 with the 0x1e repack */
 		reg = <0x1a>;
 
 		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK0>;

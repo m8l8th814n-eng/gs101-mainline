@@ -69,9 +69,12 @@
  * SYSREG_CSIS (0x1A420000) WDMA routing, as the stock HAL programs it
  * (liblyric csi_context.cc, bank 0xb): a "slot" register per link input
  * (0x430 + slot * 4 = csis link number), a per-WDMA-context mux (0x408 +
- * ctx * 4 = slot) and one enable bit per (link, ctx) pair in 0x488
- * (1 << (link + ctx * 8)). The link index alone is not enough for the
- * receiver to reach the DMA. We use slot = ctx.
+ * ctx * 4 = slot) and one enable bit per (link, slot) pair in 0x488
+ * (1 << (link + slot * 8); the HAL writes link + ctx * 8 with slot == ctx).
+ * The link index alone is not enough for the receiver to reach the DMA.
+ * Default slot 0 for every instance (sysreg_slot), so only one link can
+ * feed the WDMA at a time; slot = ctx (sysreg_slot = -1) passed nothing in
+ * EBUF bypass (2026-09-19, 2026-09-22).
  */
 #define GS101_SYSREG_CSIS_LINK_SLOT(slot)	(0x430 + (slot) * 4)
 #define GS101_SYSREG_CSIS_DMA_MUX(ctx)		(0x408 + (ctx) * 4)
@@ -646,9 +649,18 @@ static void gs101_csis_hw_start(struct gs101_csis *csis, dma_addr_t addr)
 			     GS101_SYSREG_CSIS_LINK_SLOT(slot), csis->link_idx);
 		regmap_write(csis->sysreg,
 			     GS101_SYSREG_CSIS_DMA_MUX(csis->dma_ch), slot);
+		/*
+		 * 2026-09-22: the enable bit is per (link, SLOT), not per
+		 * (link, context). Proven on a fresh boot: the rear (link1)
+		 * on context 1 wrote nothing with bit 9 (link + ctx*8) set,
+		 * and delivered live frames at once with bit 1 set before its
+		 * first start. With the default slot 0 for every instance
+		 * this is BIT(link). The HAL's link + ctx*8 is the same
+		 * expression because it always uses slot == ctx.
+		 */
 		regmap_update_bits(csis->sysreg, GS101_SYSREG_CSIS_DMA_EN,
-				   BIT(csis->link_idx + csis->dma_ch * 8),
-				   BIT(csis->link_idx + csis->dma_ch * 8));
+				   BIT(csis->link_idx + slot * 8),
+				   BIT(csis->link_idx + slot * 8));
 	}
 #if 0	/* pablo-style mux write into the DMA context: not this hardware's register */
 	writel(csis->link_idx, ctx + GS101_CSIS_DMA_MUX_OFFSET);
