@@ -1,13 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
 /*
- * cs35l41.h -- CS35L41 ALSA SoC audio driver
+ * cs35l41.h -- CS35L41(DNA) ALSA SoC audio driver
  *
  * Copyright 2017-2020 Cirrus Logic, Inc.
  *
  * Author: Brian Austin <brian.austin@cirrus.com>
  *         David Rhodes <david.rhodes@cirrus.com>
- *
+ *	   Simon Cederborg <m8l8th814n@gmail.com>
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
