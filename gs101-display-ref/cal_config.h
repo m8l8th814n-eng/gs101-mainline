@@ -29,8 +29,6 @@
 #include <drm/drm_print.h>
 #else
 
-/* TODO: Check with u-boot */
-/* non-exist function define if required */
 #ifndef readl
 #define readl
 #define writel
@@ -69,8 +67,7 @@ struct cal_regs_desc {
 	phys_addr_t start;
 };
 
-/* common function macro for register control file */
-/* to get cal_regs_desc */
+
 #define cal_regs_desc_check(type, id, type_max, id_max)		\
 	({ if (type > type_max || id > id_max) {		\
 	 cal_log_err(id, "type(%d): id(%d)\n", type, id);	\
