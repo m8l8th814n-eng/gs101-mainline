@@ -2518,6 +2518,7 @@
 
 			channel-max-pending-msgs = <128>;
 			block-channel-threshold = <64>;
+			hotword-supported = "true";
 		};
 	};
 
