@@ -112,6 +112,14 @@
 		regulator-boot-on;
 	};
 
+	tof_pwren: regulator-tof {
+		compatible = "regulator-fixed";
+		regulator-name = "tof-pwren";
+		gpio = <&gpp22 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&slg51000_ldo1>;
+	};
+
 	/*
 	 * Front camera (IMX355) digital/IO rails. On the vendor these are
 	 * board rails that stay on; LWIS only toggles avdd (slg51000_ldo1).
@@ -1278,6 +1286,13 @@
 		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
 	};
 
+	tof_irq: tof-irq {
+		samsung,pins = "gpa7-1";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+	};
+
 	key_volup: key-volup-pins {
 		samsung,pins = "gpa8-1";
 		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
@@ -2136,6 +2151,16 @@
 				link-frequencies = /bits/ 64 <798000000>;
 			};
 		};
+	};
+
+	tof: proximity@29 {
+		compatible = "st,vl53l1x";
+		reg = <0x29>;
+		vdd-supply = <&tof_pwren>;
+		reset-gpios = <&gpp15 0 GPIO_ACTIVE_LOW>;
+		interrupts-extended = <&gpa7 1 IRQ_TYPE_EDGE_FALLING>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&tof_irq>;
 	};
 };
 
