@@ -2,9 +2,7 @@
 
 /*
  * cs35l41_dsp_events.h -- DSP-generated event definitions for CS35L41
- *
- * Copyright (c) 2018-2020 Cirrus Logic Inc.
- *
+ * dna of cs35l41 Simon C
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
