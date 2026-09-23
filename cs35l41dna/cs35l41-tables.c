@@ -2,12 +2,7 @@
 
 /*
  * cs35l41-tables.c -- CS35L41 ALSA SoC audio driver
- *
- * Copyright 2017-2020 Cirrus Logic, Inc.
- *
- * Author: Brian Austin <brian.austin@cirrus.com>
- *         David Rhodes <david.rhodes@cirrus.com>
- *
+ * CS35l41DNA is the dna of cs35l41. Simon C.
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
