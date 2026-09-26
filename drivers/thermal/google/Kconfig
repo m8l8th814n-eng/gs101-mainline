@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config TENSOR_TMU
+	tristate "Google Tensor thermal management unit driver"
+	depends on THERMAL_OF
+	depends on HAS_IOMEM
+	help
+	  Direct-MMIO reader for the Google Tensor (gs101/gs201/zuma) TMU.
+	  Reads the live CURRENT_TEMP/TRIMINFO registers (already powered and
+	  calibrated by ACPM firmware) and exposes them as thermal zones.
