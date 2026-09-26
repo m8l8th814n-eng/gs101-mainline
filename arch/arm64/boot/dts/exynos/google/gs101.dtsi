@@ -11,6 +11,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/soc/samsung,exynos-usi.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "google,gs101";
@@ -152,6 +153,7 @@
 			capacity-dmips-mhz = <1024>;
 			dynamic-power-coefficient = <650>;
 			operating-points-v2 = <&cpucl2_opp_table>;
+			#cooling-cells = <2>;
 		};
 
 		cpu7: cpu@700 {
@@ -665,6 +667,12 @@
 			clocks = <&cmu_misc CLK_GOUT_MISC_OTP_CON_TOP_PCLK>;
 			clock-names = "pclk";
 			interrupts = <GIC_SPI 752 IRQ_TYPE_LEVEL_HIGH 0>;
+		};
+
+		tmu_cpu: tmu@100a0000 {
+			compatible = "google,gs101-tmu";
+			reg = <0x100a0000 0x800>;
+			#thermal-sensor-cells = <1>;
 		};
 
 		cmu_misc: clock-controller@10010000 {
@@ -2538,6 +2546,35 @@
 		   <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW) 0>,
 		   <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW) 0>,
 		   <GIC_PPI 12 (GIC_CPU_MASK_SIMPLE(8) | IRQ_TYPE_LEVEL_LOW) 0>;
+	};
+
+	thermal-zones {
+		cpu_big_thermal: cpu-big-thermal {
+			polling-delay-passive = <100>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_cpu 0>;
+
+			trips {
+				cpu_big_alert: alert {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				cpu_big_crit: critical {
+					temperature = <105000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_big_alert>;
+					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
 	};
 };
 
