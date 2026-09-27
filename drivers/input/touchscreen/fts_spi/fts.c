@@ -2456,7 +2456,7 @@ static void fts_enter_pointer_event_handler(struct fts_ts_info *info,
 		tag, __func__, *event, touchId, x, y, major, minor, angle,
 		touchType);
 	if (eventid == 0x13) {
-		logError(1, "%s  %s :  Event 0x%02x - Press ID[%d] type = %d\n",
+		logError(0, "%s  %s :  Event 0x%02x - Press ID[%d] type = %d\n",
 			 tag, __func__, event[0], touchId, touchType);
 	}
 
