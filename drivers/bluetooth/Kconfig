@@ -472,4 +472,12 @@ config BT_INTEL_PCIE
 
 	  Say Y here to compiler support for Intel Bluetooth PCIe device into
 	  the kernel or say M to compile it as module (btintel_pcie)
+
+config BT_REGON
+	tristate "BCM4389 BT_REG_ON / wake control (gs101)"
+	depends on GPIOLIB && OF
+	help
+	  Minimal driver that owns the BT_REG_ON, device-wakeup and host-wakeup
+	  GPIOs on gs101 and exposes them via sysfs, replacing the gpio-hog so
+	  the BCM4389 BT core can be power-cycled from userspace.
 endmenu

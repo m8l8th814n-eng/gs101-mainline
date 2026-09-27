@@ -620,6 +620,23 @@
 		#cooling-cells = <2>;
 	};
 
+	/*
+	 * BT power/wake node (goog,nitrous / bt-regon driver). Disabled while the
+	 * serdev bluetooth child on serial_16 (hci_uart_bcm) owns
+	 * BT_REG_ON/dev-wake/host-wake and registers hci0. The two cannot both
+	 * claim these GPIOs; re-enable this (and drop the serdev child) to drive
+	 * BT power from userspace instead.
+	 */
+	btbcm: bt-regon {
+		compatible = "goog,nitrous";
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_reg_on &bt_dev_wake &bt_host_wake>;
+		shutdown-gpios      = <&gpp16 2 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&gpp14 3 GPIO_ACTIVE_HIGH>;
+		host-wakeup-gpios   = <&gpa6 6 GPIO_ACTIVE_HIGH>;
+		status = "disabled";
+	};
+
 	/* DPU's clients: DPP0 today, further planes as they are added. */
 	iommu_group_dpu: iommu-group-dpu {
 		compatible = "samsung,sysmmu-group";
@@ -2299,11 +2316,9 @@
 		 * cmu_apm rather than cmu_peric. WiFi already powers the chip
 		 * through wl_reg_on; Bluetooth has its own bt_reg_on line.
 		 *
-		 * The child binds mainline's btbcm/hci_uart over serdev instead
-		 * of the vendor's out-of-tree "goog,nitrous" wrapper. btbcm has
-		 * no 4389 entry; brcm,bcm4349-bt is the nearest and the closest
-		 * generation. Firmware is a .hcd patch file already in
-		 * /lib/firmware/brcm.
+		 * Keep serial_16 as a plain tty, as in the vendor DT. The
+		 * vendor HCI initialization runs in userspace over
+		 * /dev/ttySAC16; no serdev child is attached here.
 		 */
 		usi_uart_bt: usi@175b00c0 {
 			compatible = "google,gs101-usi", "samsung,exynos850-usi";
@@ -2329,24 +2344,18 @@
 				clock-names = "uart", "clk_uart_baud0";
 				samsung,uart-fifosize = <256>;
 				current-speed = <115200>;
-				pinctrl-names = "default";
+				pinctrl-names = "default", "sleep";
 				pinctrl-0 = <&uart16_bus>;
+				pinctrl-1 = <&uart16_sleep_rts &uart16_sleep_tx>;
 				status = "okay";
 
-				/*
-				 * No serdev bluetooth child on purpose. With one,
-				 * hci_uart_bcm claims the port and dies on
-				 * "0xfc18 tx timeout": the BCM4389 HCI init/.hcd
-				 * sequence lives in Android's userspace BT HAL,
-				 * not in any kernel driver we can port. Leaving
-				 * the child out keeps serial_16 a plain tty
-				 * (/dev/ttySAC16) so the init sequence and baud
-				 * rates can be probed from userspace without a
-				 * build per guess. BT_REG_ON and dev-wake are
-				 * held asserted by gpio-hogs below so the chip is
-				 * powered while probing. Restore the child once
-				 * the working init handshake is known.
-				 */
+				bluetooth {
+					compatible = "brcm,bcm4349-bt";
+					shutdown-gpios = <&gpp16 2 GPIO_ACTIVE_HIGH>;
+					device-wakeup-gpios = <&gpp14 3 GPIO_ACTIVE_HIGH>;
+					host-wakeup-gpios = <&gpa6 6 GPIO_ACTIVE_HIGH>;
+					max-speed = <3000000>;
+				};
 			};
 		};
 

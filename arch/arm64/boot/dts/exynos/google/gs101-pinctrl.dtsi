@@ -147,9 +147,34 @@
 		samsung,pin-function = <GS101_PIN_FUNC_2>;
 		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
 	};
+
+	/* Keep the Bluetooth controller's RTS asserted while UART16 sleeps. */
+	uart16_sleep_rts: uart16-sleep-rts-pins {
+		samsung,pins = "gpa3-2";
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-val = <1>;
+	};
+
+	/* Vendor UART16 drives TX as a GPIO in its low-power RTS state. */
+	uart16_sleep_tx: uart16-sleep-tx-pins {
+		samsung,pins = "gpa3-1";
+		samsung,pin-function = <1>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-val = <1>;
+	};
 };
 
 &pinctrl_far_alive {
+	bt_host_wake: bt-host-wake-pins {
+		samsung,pins = "gpa6-6";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_DOWN>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+		samsung,pin-con-pdn = <GS101_PIN_PDN_PREV>;
+		samsung,pin-pud-pdn = <GS101_PIN_PULL_DOWN>;
+	};
+
 	gpa6: gpa6-gpio-bank {
 		gpio-controller;
 		#gpio-cells = <2>;
@@ -381,6 +406,24 @@
 };
 
 &pinctrl_peric0 {
+	bt_reg_on: bt-reg-on-pins {
+		samsung,pins = "gpp16-2";
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+		samsung,pin-con-pdn = <GS101_PIN_PDN_PREV>;
+		samsung,pin-pud-pdn = <GS101_PIN_PULL_NONE>;
+	};
+
+	bt_dev_wake: bt-dev-wake-pins {
+		samsung,pins = "gpp14-3";
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+		samsung,pin-con-pdn = <GS101_PIN_PDN_PREV>;
+		samsung,pin-pud-pdn = <GS101_PIN_PULL_DOWN>;
+	};
+
 	gpp0: gpp0-gpio-bank {
 		gpio-controller;
 		#gpio-cells = <2>;
@@ -486,12 +529,15 @@
 		#interrupt-cells = <2>;
 
 		/* BT device-wakeup, held asserted alongside bt_reg_on. */
+		/* 2026-09-26: disabled — bt-regon driver owns this line now. */
+#if 0
 		bt-dev-wake-hog {
 			gpio-hog;
 			gpios = <3 0>;
 			output-high;
 			line-name = "bt_dev_wake";
 		};
+#endif
 	};
 
 	gpp15: gpp15-gpio-bank {
@@ -513,12 +559,15 @@
 		 * userspace HCI probing. Drop this hog when a real BT driver
 		 * takes the line back.
 		 */
+		/* 2026-09-26: disabled — bt-regon driver owns this line now. */
+#if 0
 		bt-reg-on-hog {
 			gpio-hog;
 			gpios = <2 0>;
 			output-high;
 			line-name = "bt_reg_on";
 		};
+#endif
 	};
 
 	gpp17: gpp17-gpio-bank {
