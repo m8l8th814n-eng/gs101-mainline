@@ -2333,6 +2333,7 @@
 			assigned-clock-parents = <&cmu_apm CLK_MOUT_APM_FUNCSRC>;
 			samsung,sysreg = <&sysreg_apm 0x4e4>;
 			samsung,mode = <USI_MODE_UART>;
+			samsung,clkreq-on; /* needed for UART mode */
 			status = "okay";
 
 			serial_16: serial@175b0000 {
@@ -2344,16 +2345,30 @@
 				clock-names = "uart", "clk_uart_baud0";
 				samsung,uart-fifosize = <256>;
 				current-speed = <115200>;
-				pinctrl-names = "default", "sleep";
+				samsung,rts-gpio-control;
+				samsung,uart-logging;
+				pinctrl-names = "default", "rts", "tx_dat";
 				pinctrl-0 = <&uart16_bus>;
-				pinctrl-1 = <&uart16_sleep_rts &uart16_sleep_tx>;
+				pinctrl-1 = <&uart16_rts &uart16_tx_con>;
+				pinctrl-2 = <&uart16_tx_dat>;
 				status = "okay";
 
 				bluetooth {
-					compatible = "brcm,bcm4349-bt";
+					compatible = "brcm,bcm4389-bt", "brcm,bcm4349-bt";
+					/* firmware-name = "brcm/BCM.hcd"; */
+					firmware-name = "brcm/BTFW_B.hcd";
 					shutdown-gpios = <&gpp16 2 GPIO_ACTIVE_HIGH>;
 					device-wakeup-gpios = <&gpp14 3 GPIO_ACTIVE_HIGH>;
 					host-wakeup-gpios = <&gpa6 6 GPIO_ACTIVE_HIGH>;
+					/*
+					 * Autobaud mode (test 2026-09-28): skips the early
+					 * 0xfc18 baud change AND asserts BT_UART_CTS_N via
+					 * hci_uart_set_flow_control(false) instead of AFC, so
+					 * the chip is told it may transmit. Tests whether the
+					 * mute HCI is an RTS/CTS/flow-control issue.
+					 */
+					/* brcm,requires-autobaud-mode; */
+					/* Defer baud-rate change until UART init works. */
 					max-speed = <3000000>;
 				};
 			};

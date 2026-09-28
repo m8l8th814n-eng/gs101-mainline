@@ -148,20 +148,26 @@
 		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
 	};
 
-	/* Keep the Bluetooth controller's RTS asserted while UART16 sleeps. */
-	uart16_sleep_rts: uart16-sleep-rts-pins {
+	/* Vendor UART16's RTS GPIO state. */
+	uart16_rts: uart16-rts-pins {
 		samsung,pins = "gpa3-2";
 		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
 		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
 		samsung,pin-val = <1>;
 	};
 
-	/* Vendor UART16 drives TX as a GPIO in its low-power RTS state. */
-	uart16_sleep_tx: uart16-sleep-tx-pins {
+	/* Park TX high before switching RTS to GPIO, as the vendor driver does. */
+	uart16_tx_dat: uart16-tx-dat-pins {
 		samsung,pins = "gpa3-1";
-		samsung,pin-function = <1>;
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
 		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
 		samsung,pin-val = <1>;
+	};
+
+	/* Vendor's RTS state also switches TX to GPIO control. */
+	uart16_tx_con: uart16-tx-con-pins {
+		samsung,pins = "gpa3-1";
+		samsung,pin-function = <1>;
 	};
 };
 

@@ -33,7 +33,7 @@
 #define BDADDR_BCM43341B (&(bdaddr_t) {{0xac, 0x1f, 0x00, 0x1b, 0x34, 0x43}})
 
 #define BCM_FW_NAME_LEN			64
-#define BCM_FW_NAME_COUNT_MAX		4
+#define BCM_FW_NAME_COUNT_MAX		5
 /* For kmalloc-ing the fw-name array instead of putting it on the stack */
 typedef char bcm_fw_name[BCM_FW_NAME_LEN];
 
@@ -216,6 +216,16 @@ int btbcm_patchram(struct hci_dev *hdev, const struct firmware *fw)
 	struct sk_buff *skb;
 	u16 opcode;
 	int err = 0;
+	bool no_ack_write_ram = false;
+
+	/*
+	 * The BCM4389 minidriver does not answer Write RAM (0xfc4c) records;
+	 * the stock Pixel 6 HAL streams them without waiting and only waits
+	 * for Launch RAM (0xfc4e).
+	 */
+	if (hdev->dev.parent && hdev->dev.parent->of_node)
+		no_ack_write_ram = of_device_is_compatible(hdev->dev.parent->of_node,
+							   "brcm,bcm4389-bt");
 
 	/* Start Download */
 	skb = __hci_cmd_sync(hdev, 0xfc2e, 0, NULL, HCI_INIT_TIMEOUT);
@@ -250,6 +260,16 @@ int btbcm_patchram(struct hci_dev *hdev, const struct firmware *fw)
 		fw_size -= cmd->plen;
 
 		opcode = le16_to_cpu(cmd->opcode);
+
+		if (no_ack_write_ram && opcode == 0xfc4c) {
+			err = __hci_cmd_send(hdev, opcode, cmd->plen, cmd_param);
+			if (err) {
+				bt_dev_err(hdev, "BCM: Patch command %04x failed (%d)",
+					   opcode, err);
+				return err;
+			}
+			continue;
+		}
 
 		skb = __hci_cmd_sync(hdev, opcode, cmd->plen, cmd_param,
 				     HCI_INIT_TIMEOUT);
@@ -646,6 +666,18 @@ int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud
 		GFP_KERNEL);
 	if (!fw_name)
 		return -ENOMEM;
+
+	/* An explicit firmware-name in the DT node is tried first. */
+	if (hdev->dev.parent && hdev->dev.parent->of_node) {
+		const char *dt_fw_name;
+
+		if (!of_property_read_string(hdev->dev.parent->of_node,
+					     "firmware-name", &dt_fw_name)) {
+			snprintf(fw_name[fw_name_count], BCM_FW_NAME_LEN,
+				 "%s", dt_fw_name);
+			fw_name_count++;
+		}
+	}
 
 	if (hw_name) {
 		if (board_name) {

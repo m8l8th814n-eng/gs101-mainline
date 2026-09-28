@@ -27,17 +27,23 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/debugfs.h>
+#include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/math.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
+#include <linux/printk.h>
 #include <linux/serial.h>
 #include <linux/serial_core.h>
 #include <linux/serial_s3c.h>
 #include <linux/slab.h>
+#include <linux/stdarg.h>
+#include <linux/timekeeping.h>
 #include <linux/sysrq.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
@@ -61,6 +67,22 @@
 #define S3C24XX_TX_DMA			2
 #define S3C24XX_RX_PIO			1
 #define S3C24XX_RX_DMA			2
+#define S3C24XX_UART_LOG_SIZE		0xC8000
+#define S3C24XX_UART_LOG_LINE		16
+
+struct s3c24xx_uart_log {
+	spinlock_t lock;
+	char *data;
+	size_t size;
+	size_t head;
+	size_t count;
+	struct dentry *debugfs_dir;
+};
+
+struct s3c24xx_uart_log_snapshot {
+	char *data;
+	size_t size;
+};
 
 /* flag to ignore all characters coming in */
 #define RXSTAT_DUMMY_READ (0x10000000)
@@ -147,6 +169,13 @@ struct s3c24xx_uart_port {
 	struct clk			*baudclk;
 	struct uart_port		port;
 	const struct s3c24xx_serial_drv_data	*drv_data;
+	struct pinctrl			*pinctrl;
+	struct pinctrl_state		*pinctrl_default;
+	struct pinctrl_state		*pinctrl_rts;
+	struct pinctrl_state		*pinctrl_tx_dat;
+	bool				rts_gpio_control;
+	struct s3c24xx_uart_log		*log;
+	bool				uart_logging;
 
 	/* reference to platform data */
 	const struct s3c2410_uartcfg	*cfg;
@@ -229,6 +258,133 @@ static inline struct s3c24xx_uart_port *to_ourport(struct uart_port *port)
 {
 	return container_of(port, struct s3c24xx_uart_port, port);
 }
+
+static void s3c24xx_uart_log_write(struct s3c24xx_uart_port *ourport,
+				  const char *data, size_t len)
+{
+	struct s3c24xx_uart_log *log = ourport->log;
+	unsigned long flags;
+	size_t i;
+
+	if (!READ_ONCE(ourport->uart_logging) || !log)
+		return;
+
+	spin_lock_irqsave(&log->lock, flags);
+	for (i = 0; i < len; i++) {
+		log->data[log->head] = data[i];
+		log->head = (log->head + 1) % log->size;
+		if (log->count < log->size)
+			log->count++;
+	}
+	spin_unlock_irqrestore(&log->lock, flags);
+}
+
+static void s3c24xx_uart_log_bytes(struct s3c24xx_uart_port *ourport,
+				  const char *direction, const u8 *data,
+				  size_t len)
+{
+	struct timespec64 ts;
+	char line[S3C24XX_UART_LOG_LINE * 3 + 80];
+	char hex[S3C24XX_UART_LOG_LINE * 3 + 1];
+	size_t chunk, pos = 0;
+
+	if (!READ_ONCE(ourport->uart_logging) || !ourport->log || !len)
+		return;
+
+	ktime_get_real_ts64(&ts);
+	while (len) {
+		chunk = min_t(size_t, len, S3C24XX_UART_LOG_LINE);
+		hex_dump_to_buffer(data, chunk, S3C24XX_UART_LOG_LINE, 1,
+				   hex, sizeof(hex), false);
+		pos = scnprintf(line, sizeof(line),
+				"[%lld.%06lu] %s len=%zu: %s\n",
+				(long long)ts.tv_sec,
+				(unsigned long)(ts.tv_nsec / NSEC_PER_USEC),
+				direction, chunk, hex);
+		s3c24xx_uart_log_write(ourport, line, pos);
+		data += chunk;
+		len -= chunk;
+	}
+}
+
+static void s3c24xx_uart_log_event(struct s3c24xx_uart_port *ourport,
+				  const char *fmt, ...)
+{
+	struct timespec64 ts;
+	char event[192], line[256];
+	va_list args;
+	int len;
+
+	if (!READ_ONCE(ourport->uart_logging) || !ourport->log)
+		return;
+
+	va_start(args, fmt);
+	vscnprintf(event, sizeof(event), fmt, args);
+	va_end(args);
+	ktime_get_real_ts64(&ts);
+	len = scnprintf(line, sizeof(line), "[%lld.%06lu] %s\n",
+			(long long)ts.tv_sec,
+			(unsigned long)(ts.tv_nsec / NSEC_PER_USEC), event);
+	s3c24xx_uart_log_write(ourport, line, len);
+}
+
+static int s3c24xx_uart_log_open(struct inode *inode, struct file *file)
+{
+	struct s3c24xx_uart_port *ourport = inode->i_private;
+	struct s3c24xx_uart_log *log = ourport->log;
+	struct s3c24xx_uart_log_snapshot *snapshot;
+	unsigned long flags;
+	size_t start, first;
+
+	if (!log)
+		return -ENODEV;
+
+	snapshot = kzalloc(sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot)
+		return -ENOMEM;
+	snapshot->data = kmalloc(log->size, GFP_KERNEL);
+	if (!snapshot->data) {
+		kfree(snapshot);
+		return -ENOMEM;
+	}
+
+	spin_lock_irqsave(&log->lock, flags);
+	snapshot->size = log->count;
+	start = (log->head + log->size - log->count) % log->size;
+	first = min(log->count, log->size - start);
+	memcpy(snapshot->data, log->data + start, first);
+	memcpy(snapshot->data + first, log->data, log->count - first);
+	spin_unlock_irqrestore(&log->lock, flags);
+
+	file->private_data = snapshot;
+	return 0;
+}
+
+static ssize_t s3c24xx_uart_log_read(struct file *file, char __user *buffer,
+				     size_t count, loff_t *ppos)
+{
+	struct s3c24xx_uart_log_snapshot *snapshot = file->private_data;
+
+	return simple_read_from_buffer(buffer, count, ppos, snapshot->data,
+				       snapshot->size);
+}
+
+static int s3c24xx_uart_log_release(struct inode *inode, struct file *file)
+{
+	struct s3c24xx_uart_log_snapshot *snapshot = file->private_data;
+
+	kfree(snapshot->data);
+	kfree(snapshot);
+	return 0;
+}
+
+static const struct file_operations s3c24xx_uart_log_fops = {
+	.owner = THIS_MODULE,
+	.open = s3c24xx_uart_log_open,
+	.read = s3c24xx_uart_log_read,
+	.llseek = default_llseek,
+	.release = s3c24xx_uart_log_release,
+};
 
 /* translate a port to the device name */
 
@@ -434,6 +590,9 @@ static int s3c24xx_serial_start_tx_dma(struct s3c24xx_uart_port *ourport,
 
 	dma->tx_size = count & ~(dma_get_cache_alignment() - 1);
 	dma->tx_transfer_addr = dma->tx_addr + tail;
+	s3c24xx_uart_log_bytes(ourport, "TX",
+			       ourport->port.state->port.xmit_buf + tail,
+			       dma->tx_size);
 
 	dma_sync_single_for_device(dma->tx_chan->device->dev,
 				   dma->tx_transfer_addr, dma->tx_size,
@@ -513,6 +672,7 @@ static void s3c24xx_uart_copy_rx_to_tty(struct s3c24xx_uart_port *ourport,
 				dma->rx_size, DMA_FROM_DEVICE);
 
 	ourport->port.icount.rx += count;
+	s3c24xx_uart_log_bytes(ourport, "RX", dma->rx_buf, count);
 	if (!tty) {
 		dev_err(ourport->port.dev, "No tty port\n");
 		return;
@@ -752,8 +912,10 @@ finish:
 static void s3c24xx_serial_rx_drain_fifo(struct s3c24xx_uart_port *ourport)
 {
 	struct uart_port *port = &ourport->port;
+	u8 trace_buf[256];
 	unsigned int max_count = port->fifosize;
 	unsigned int fifocnt = 0;
+	unsigned int trace_count = 0;
 	u32 ufcon, ufstat, uerstat;
 	u8 ch, flag;
 
@@ -772,6 +934,8 @@ static void s3c24xx_serial_rx_drain_fifo(struct s3c24xx_uart_port *ourport)
 
 		uerstat = rd_regl(port, S3C2410_UERSTAT);
 		ch = rd_reg(port, S3C2410_URXH);
+		if (trace_count < ARRAY_SIZE(trace_buf))
+			trace_buf[trace_count++] = ch;
 
 		if (uart_cons_flow_enabled(port)) {
 			bool txe = s3c24xx_serial_txempty_nofifo(port);
@@ -787,6 +951,8 @@ static void s3c24xx_serial_rx_drain_fifo(struct s3c24xx_uart_port *ourport)
 					ufcon |= S3C2410_UFCON_RESETRX;
 					wr_regl(port, S3C2410_UFCON, ufcon);
 					ourport->rx_enabled = 1;
+					s3c24xx_uart_log_bytes(ourport, "RX",
+							       trace_buf, trace_count);
 					return;
 				}
 				continue;
@@ -802,6 +968,13 @@ static void s3c24xx_serial_rx_drain_fifo(struct s3c24xx_uart_port *ourport)
 			dev_dbg(port->dev,
 				"rxerr: port ch=0x%02x, rxs=0x%08x\n",
 				ch, uerstat);
+			s3c24xx_uart_log_event(ourport,
+					       "RX error ch=0x%02x UERSTAT=0x%08x ULCON=0x%08x UCON=0x%08x UMCON=0x%08x UFSTAT=0x%08x",
+					       ch, uerstat,
+					       rd_regl(port, S3C2410_ULCON),
+					       rd_regl(port, S3C2410_UCON),
+					       rd_regl(port, S3C2410_UMCON),
+					       rd_regl(port, S3C2410_UFSTAT));
 
 			/* check for break */
 			if (uerstat & S3C2410_UERSTAT_BREAK) {
@@ -834,6 +1007,7 @@ static void s3c24xx_serial_rx_drain_fifo(struct s3c24xx_uart_port *ourport)
 				 ch, flag);
 	}
 
+	s3c24xx_uart_log_bytes(ourport, "RX", trace_buf, trace_count);
 	tty_flip_buffer_push(&port->state->port);
 }
 
@@ -859,6 +1033,8 @@ static void s3c24xx_serial_tx_chars(struct s3c24xx_uart_port *ourport)
 {
 	struct uart_port *port = &ourport->port;
 	struct tty_port *tport = &port->state->port;
+	u8 trace_buf[256];
+	unsigned int trace_count = 0;
 	unsigned int count, dma_count = 0, tail;
 
 	count = kfifo_out_linear(&tport->xmit_fifo, &tail, UART_XMIT_SIZE);
@@ -875,6 +1051,8 @@ static void s3c24xx_serial_tx_chars(struct s3c24xx_uart_port *ourport)
 	}
 
 	if (port->x_char) {
+		trace_buf[0] = port->x_char;
+		s3c24xx_uart_log_bytes(ourport, "TX", trace_buf, 1);
 		wr_reg(port, S3C2410_UTXH, port->x_char);
 		port->icount.tx++;
 		port->x_char = 0;
@@ -904,13 +1082,18 @@ static void s3c24xx_serial_tx_chars(struct s3c24xx_uart_port *ourport)
 			break;
 
 		wr_reg(port, S3C2410_UTXH, ch);
+		if (trace_count < ARRAY_SIZE(trace_buf))
+			trace_buf[trace_count++] = ch;
 		count--;
 	}
 
 	if (!count && dma_count) {
+		s3c24xx_uart_log_bytes(ourport, "TX", trace_buf, trace_count);
 		s3c24xx_serial_start_tx_dma(ourport, dma_count, tail);
 		return;
 	}
+
+	s3c24xx_uart_log_bytes(ourport, "TX", trace_buf, trace_count);
 
 	if (kfifo_len(&tport->xmit_fifo) < WAKEUP_CHARS)
 		uart_write_wakeup(port);
@@ -1002,6 +1185,7 @@ static unsigned int s3c24xx_serial_get_mctrl(struct uart_port *port)
 
 static void s3c24xx_serial_set_mctrl(struct uart_port *port, unsigned int mctrl)
 {
+	struct s3c24xx_uart_port *ourport = to_ourport(port);
 	u32 umcon = rd_regl(port, S3C2410_UMCON);
 	u32 ucon = rd_regl(port, S3C2410_UCON);
 
@@ -1018,6 +1202,9 @@ static void s3c24xx_serial_set_mctrl(struct uart_port *port, unsigned int mctrl)
 		ucon &= ~S3C2410_UCON_LOOPBACK;
 
 	wr_regl(port, S3C2410_UCON, ucon);
+	s3c24xx_uart_log_event(ourport,
+			       "set_mctrl mctrl=0x%x UMCON=0x%08x UCON=0x%08x",
+			       mctrl, umcon, ucon);
 }
 
 static void s3c24xx_serial_break_ctl(struct uart_port *port, int break_state)
@@ -1607,6 +1794,9 @@ static void s3c24xx_serial_set_termios(struct uart_port *port,
 		port->ignore_status_mask |= RXSTAT_DUMMY_READ;
 
 	uart_port_unlock_irqrestore(port, flags);
+	s3c24xx_uart_log_event(ourport,
+			       "set_termios baud=%u divisor=%u slot=0x%08x ULCON=0x%08x UMCON=0x%08x",
+			       baud, quot, udivslot, ulcon, umcon);
 }
 
 static const char *s3c24xx_serial_type(struct uart_port *port)
@@ -1954,6 +2144,53 @@ static int s3c24xx_serial_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 	ourport = &s3c24xx_serial_ports[index];
+	ourport->rts_gpio_control = false;
+	ourport->pinctrl = NULL;
+	ourport->pinctrl_default = NULL;
+	ourport->pinctrl_rts = NULL;
+	ourport->pinctrl_tx_dat = NULL;
+	ourport->log = NULL;
+	ourport->uart_logging = np &&
+		of_property_read_bool(np, "samsung,uart-logging");
+	if (ourport->uart_logging) {
+		ourport->log = devm_kzalloc(&pdev->dev, sizeof(*ourport->log),
+					    GFP_KERNEL);
+		if (!ourport->log)
+			return -ENOMEM;
+		ourport->log->size = S3C24XX_UART_LOG_SIZE;
+		ourport->log->data = devm_kmalloc(&pdev->dev,
+						 ourport->log->size, GFP_KERNEL);
+		if (!ourport->log->data)
+			return -ENOMEM;
+		spin_lock_init(&ourport->log->lock);
+	}
+	if (np && of_property_read_bool(np, "samsung,rts-gpio-control")) {
+		ourport->rts_gpio_control = true;
+		ourport->pinctrl = devm_pinctrl_get(&pdev->dev);
+		if (IS_ERR(ourport->pinctrl))
+			return dev_err_probe(&pdev->dev,
+					     PTR_ERR(ourport->pinctrl),
+					     "failed to get RTS pinctrl\n");
+
+		ourport->pinctrl_default = pinctrl_lookup_state(ourport->pinctrl,
+								"default");
+		ourport->pinctrl_rts = pinctrl_lookup_state(ourport->pinctrl,
+								"rts");
+		ourport->pinctrl_tx_dat = pinctrl_lookup_state(ourport->pinctrl,
+								"tx_dat");
+		if (IS_ERR(ourport->pinctrl_default))
+			return dev_err_probe(&pdev->dev,
+					     PTR_ERR(ourport->pinctrl_default),
+					     "failed to find default pinctrl state\n");
+		if (IS_ERR(ourport->pinctrl_rts))
+			return dev_err_probe(&pdev->dev,
+					     PTR_ERR(ourport->pinctrl_rts),
+					     "failed to find rts pinctrl state\n");
+		if (IS_ERR(ourport->pinctrl_tx_dat))
+			return dev_err_probe(&pdev->dev,
+					     PTR_ERR(ourport->pinctrl_tx_dat),
+					     "failed to find tx_dat pinctrl state\n");
+	}
 
 	s3c24xx_serial_init_port_default(index);
 
@@ -2033,6 +2270,18 @@ static int s3c24xx_serial_probe(struct platform_device *pdev)
 	dev_dbg(&pdev->dev, "%s: adding port\n", __func__);
 	uart_add_one_port(&s3c24xx_uart_drv, &ourport->port);
 	platform_set_drvdata(pdev, &ourport->port);
+	if (ourport->uart_logging) {
+		ourport->log->debugfs_dir = debugfs_create_dir(dev_name(&pdev->dev),
+							      NULL);
+		if (!IS_ERR_OR_NULL(ourport->log->debugfs_dir))
+			debugfs_create_bool("uart_logging", 0600,
+					    ourport->log->debugfs_dir,
+					    &ourport->uart_logging);
+		if (!IS_ERR_OR_NULL(ourport->log->debugfs_dir))
+			debugfs_create_file("uart_log", 0400,
+					     ourport->log->debugfs_dir, ourport,
+					     &s3c24xx_uart_log_fops);
+	}
 
 	/*
 	 * Deactivate the clock enabled in s3c24xx_serial_init_port here,
@@ -2052,8 +2301,13 @@ static void s3c24xx_serial_remove(struct platform_device *dev)
 {
 	struct uart_port *port = s3c24xx_dev_to_port(&dev->dev);
 
-	if (port)
+	if (port) {
+		struct s3c24xx_uart_port *ourport = to_ourport(port);
+
+		if (ourport->log)
+			debugfs_remove_recursive(ourport->log->debugfs_dir);
 		uart_remove_one_port(&s3c24xx_uart_drv, port);
+	}
 
 	uart_unregister_driver(&s3c24xx_uart_drv);
 }
@@ -2063,9 +2317,32 @@ static void s3c24xx_serial_remove(struct platform_device *dev)
 static int s3c24xx_serial_suspend(struct device *dev)
 {
 	struct uart_port *port = s3c24xx_dev_to_port(dev);
+	struct s3c24xx_uart_port *ourport;
+	int ret;
 
-	if (port)
+	if (port) {
+		ourport = to_ourport(port);
+		s3c24xx_uart_log_event(ourport, "system suspend");
 		uart_suspend_port(&s3c24xx_uart_drv, port);
+		if (ourport->rts_gpio_control) {
+			/* Match the vendor sequence: park TX high before asserting RTS. */
+			ret = pinctrl_select_state(ourport->pinctrl,
+						   ourport->pinctrl_tx_dat);
+			if (!ret) {
+				udelay(10);
+				ret = pinctrl_select_state(ourport->pinctrl,
+							   ourport->pinctrl_rts);
+			}
+			if (ret) {
+				pinctrl_select_state(ourport->pinctrl,
+						     ourport->pinctrl_default);
+				uart_resume_port(&s3c24xx_uart_drv, port);
+				dev_err(dev, "failed to select UART low-power pins: %d\n",
+					ret);
+				return ret;
+			}
+		}
+	}
 
 	return 0;
 }
@@ -2076,6 +2353,15 @@ static int s3c24xx_serial_resume(struct device *dev)
 	struct s3c24xx_uart_port *ourport = to_ourport(port);
 
 	if (port) {
+		s3c24xx_uart_log_event(ourport, "system resume");
+		if (ourport->rts_gpio_control) {
+			int ret = pinctrl_select_state(ourport->pinctrl,
+						       ourport->pinctrl_default);
+
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "failed to restore default UART pins\n");
+		}
 		clk_prepare_enable(ourport->clk);
 		if (!IS_ERR(ourport->baudclk))
 			clk_prepare_enable(ourport->baudclk);
@@ -2083,7 +2369,6 @@ static int s3c24xx_serial_resume(struct device *dev)
 		if (!IS_ERR(ourport->baudclk))
 			clk_disable_unprepare(ourport->baudclk);
 		clk_disable_unprepare(ourport->clk);
-
 		uart_resume_port(&s3c24xx_uart_drv, port);
 	}
 
