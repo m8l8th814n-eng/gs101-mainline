@@ -32,6 +32,7 @@
 #include <video/mipi_display.h>
 
 #include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
@@ -47,6 +48,7 @@
 struct s6e3fc3 {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi;
+	struct drm_connector *connector;
 	struct delayed_work bl_work;
 	bool hbm;
 };
@@ -59,6 +61,21 @@ static inline struct s6e3fc3 *to_s6e3fc3(struct drm_panel *panel)
 static const struct drm_display_mode s6e3fc3_mode = {
 	.name = "1080x2400x60",
 	.clock = 168498,
+	.hdisplay = 1080,
+	.hsync_start = 1080 + 32,
+	.hsync_end = 1080 + 32 + 12,
+	.htotal = 1080 + 32 + 12 + 26,
+	.vdisplay = 2400,
+	.vsync_start = 2400 + 12,
+	.vsync_end = 2400 + 12 + 4,
+	.vtotal = 2400 + 12 + 4 + 26,
+	.width_mm = 67,
+	.height_mm = 148,
+};
+
+static const struct drm_display_mode s6e3fc3_mode_90 = {
+	.name = "1080x2400x90",
+	.clock = 253989,
 	.hdisplay = 1080,
 	.hsync_start = 1080 + 32,
 	.hsync_end = 1080 + 32 + 12,
@@ -146,6 +163,29 @@ static const struct backlight_ops s6e3fc3_bl_ops = {
 	.update_status = s6e3fc3_bl_update_status,
 };
 
+static int s6e3fc3_current_vrefresh(struct s6e3fc3 *ctx)
+{
+	struct drm_connector *connector = ctx->connector;
+
+	if (!connector || !connector->state || !connector->state->crtc)
+		return 60;
+
+	return drm_mode_vrefresh(&connector->state->crtc->state->mode);
+}
+
+static void s6e3fc3_set_vrefresh(struct s6e3fc3 *ctx, int vrefresh)
+{
+	static const u8 key_on[] = { 0xf0, 0x5a, 0x5a };
+	static const u8 key_off[] = { 0xf0, 0xa5, 0xa5 };
+	static const u8 freq_update[] = { 0xf7, 0x0f };
+	u8 freq[] = { 0x60, vrefresh == 90 ? 0x08 : 0x00 };
+
+	mipi_dsi_dcs_write_buffer(ctx->dsi, key_on, sizeof(key_on));
+	mipi_dsi_dcs_write_buffer(ctx->dsi, freq, sizeof(freq));
+	mipi_dsi_dcs_write_buffer(ctx->dsi, freq_update, sizeof(freq_update));
+	mipi_dsi_dcs_write_buffer(ctx->dsi, key_off, sizeof(key_off));
+}
+
 static void s6e3fc3_bl_work(struct work_struct *work)
 {
 	struct s6e3fc3 *ctx = container_of(to_delayed_work(work),
@@ -154,6 +194,8 @@ static void s6e3fc3_bl_work(struct work_struct *work)
 
 	if (!ctx->panel.prepared)
 		return;
+
+	s6e3fc3_set_vrefresh(ctx, s6e3fc3_current_vrefresh(ctx));
 
 	if (level && level < S6E3FC3_BRIGHTNESS_MIN)
 		level = S6E3FC3_BRIGHTNESS_MIN;
@@ -193,7 +235,10 @@ static int s6e3fc3_disable(struct drm_panel *panel)
 static int s6e3fc3_get_modes(struct drm_panel *panel,
 			     struct drm_connector *connector)
 {
+	struct s6e3fc3 *ctx = to_s6e3fc3(panel);
 	struct drm_display_mode *mode;
+
+	ctx->connector = connector;
 
 	mode = drm_mode_duplicate(connector->dev, &s6e3fc3_mode);
 	if (!mode)
@@ -203,10 +248,18 @@ static int s6e3fc3_get_modes(struct drm_panel *panel,
 	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
 	drm_mode_probed_add(connector, mode);
 
+	mode = drm_mode_duplicate(connector->dev, &s6e3fc3_mode_90);
+	if (!mode)
+		return -ENOMEM;
+
+	drm_mode_set_name(mode);
+	mode->type = DRM_MODE_TYPE_DRIVER;
+	drm_mode_probed_add(connector, mode);
+
 	connector->display_info.width_mm = mode->width_mm;
 	connector->display_info.height_mm = mode->height_mm;
 
-	return 1;
+	return 2;
 }
 
 static const struct drm_panel_funcs s6e3fc3_panel_funcs = {
