@@ -22,8 +22,11 @@
  * init sequence sends 0x11, waits 120 ms, then 0x35, and ends with 0x29.
  */
 
+#include <linux/backlight.h>
 #include <linux/delay.h>
+#include <linux/devm-helpers.h>
 #include <linux/module.h>
+#include <linux/workqueue.h>
 #include <linux/of.h>
 
 #include <video/mipi_display.h>
@@ -33,9 +36,19 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
 
+#define S6E3FC3_WRCTRLD_BCTRL		0x20
+#define S6E3FC3_WRCTRLD_HBM		0xc0
+#define S6E3FC3_BRIGHTNESS_MIN		4
+#define S6E3FC3_BRIGHTNESS_DEFAULT	3000
+#define S6E3FC3_BRIGHTNESS_HBM		2048
+#define S6E3FC3_BRIGHTNESS_MAX		4095
+#define S6E3FC3_BL_REAPPLY_MS		100
+
 struct s6e3fc3 {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi;
+	struct delayed_work bl_work;
+	bool hbm;
 };
 
 static inline struct s6e3fc3 *to_s6e3fc3(struct drm_panel *panel)
@@ -85,11 +98,96 @@ static int s6e3fc3_prepare(struct drm_panel *panel)
 	return s6e3fc3_dcs(ctx, MIPI_DCS_SET_TEAR_ON);
 }
 
+static int s6e3fc3_write_wrctrld(struct s6e3fc3 *ctx, bool hbm)
+{
+	u8 val = S6E3FC3_WRCTRLD_BCTRL | (hbm ? S6E3FC3_WRCTRLD_HBM : 0);
+	ssize_t ret;
+
+	ret = mipi_dsi_dcs_write(ctx->dsi, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+				 &val, 1);
+	if (ret < 0) {
+		dev_err(&ctx->dsi->dev, "WRCTRLD %#04x failed: %zd\n", val, ret);
+		return ret;
+	}
+
+	ctx->hbm = hbm;
+	return 0;
+}
+
+static int s6e3fc3_set_brightness(struct s6e3fc3 *ctx, u16 level)
+{
+	bool hbm = level >= S6E3FC3_BRIGHTNESS_HBM;
+	int ret;
+
+	if (hbm != ctx->hbm) {
+		ret = s6e3fc3_write_wrctrld(ctx, hbm);
+		if (ret)
+			return ret;
+	}
+
+	return mipi_dsi_dcs_set_display_brightness_large(ctx->dsi, level);
+}
+
+static int s6e3fc3_bl_update_status(struct backlight_device *bl)
+{
+	struct s6e3fc3 *ctx = bl_get_data(bl);
+	int level = backlight_get_brightness(bl);
+
+	if (!ctx->panel.prepared)
+		return 0;
+
+	if (level && level < S6E3FC3_BRIGHTNESS_MIN)
+		level = S6E3FC3_BRIGHTNESS_MIN;
+
+	return s6e3fc3_set_brightness(ctx, level);
+}
+
+static const struct backlight_ops s6e3fc3_bl_ops = {
+	.update_status = s6e3fc3_bl_update_status,
+};
+
+static void s6e3fc3_bl_work(struct work_struct *work)
+{
+	struct s6e3fc3 *ctx = container_of(to_delayed_work(work),
+					   struct s6e3fc3, bl_work);
+	int level = backlight_get_brightness(ctx->panel.backlight);
+
+	if (!ctx->panel.prepared)
+		return;
+
+	if (level && level < S6E3FC3_BRIGHTNESS_MIN)
+		level = S6E3FC3_BRIGHTNESS_MIN;
+
+	if (s6e3fc3_write_wrctrld(ctx, level >= S6E3FC3_BRIGHTNESS_HBM))
+		return;
+
+	mipi_dsi_dcs_set_display_brightness_large(ctx->dsi, level);
+}
+
 static int s6e3fc3_enable(struct drm_panel *panel)
 {
 	struct s6e3fc3 *ctx = to_s6e3fc3(panel);
+	int ret;
 
-	return s6e3fc3_dcs(ctx, MIPI_DCS_SET_DISPLAY_ON);
+	ret = s6e3fc3_write_wrctrld(ctx, false);
+	if (ret)
+		return ret;
+
+	ret = s6e3fc3_dcs(ctx, MIPI_DCS_SET_DISPLAY_ON);
+	if (ret)
+		return ret;
+
+	schedule_delayed_work(&ctx->bl_work,
+			      msecs_to_jiffies(S6E3FC3_BL_REAPPLY_MS));
+	return 0;
+}
+
+static int s6e3fc3_disable(struct drm_panel *panel)
+{
+	struct s6e3fc3 *ctx = to_s6e3fc3(panel);
+
+	cancel_delayed_work_sync(&ctx->bl_work);
+	return 0;
 }
 
 static int s6e3fc3_get_modes(struct drm_panel *panel,
@@ -114,11 +212,17 @@ static int s6e3fc3_get_modes(struct drm_panel *panel,
 static const struct drm_panel_funcs s6e3fc3_panel_funcs = {
 	.prepare = s6e3fc3_prepare,
 	.enable = s6e3fc3_enable,
+	.disable = s6e3fc3_disable,
 	.get_modes = s6e3fc3_get_modes,
 };
 
 static int s6e3fc3_probe(struct mipi_dsi_device *dsi)
 {
+	const struct backlight_properties bl_props = {
+		.type = BACKLIGHT_RAW,
+		.brightness = S6E3FC3_BRIGHTNESS_DEFAULT,
+		.max_brightness = S6E3FC3_BRIGHTNESS_MAX,
+	};
 	struct device *dev = &dsi->dev;
 	struct s6e3fc3 *ctx;
 	int ret;
@@ -132,10 +236,22 @@ static int s6e3fc3_probe(struct mipi_dsi_device *dsi)
 	ctx->dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
 
+	ret = devm_delayed_work_autocancel(dev, &ctx->bl_work, s6e3fc3_bl_work);
+	if (ret)
+		return ret;
+
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO_BURST |
 			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
+
+	ctx->panel.backlight = devm_backlight_device_register(dev, dev_name(dev),
+							      dev, ctx,
+							      &s6e3fc3_bl_ops,
+							      &bl_props);
+	if (IS_ERR(ctx->panel.backlight))
+		return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
+				     "failed to register backlight\n");
 
 	drm_panel_add(&ctx->panel);
 

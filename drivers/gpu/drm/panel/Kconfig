@@ -945,6 +945,7 @@ config DRM_PANEL_SAMSUNG_S6E3FC3
 	tristate "Samsung S6E3FC3 DSI command mode panel"
 	depends on OF
 	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
 	help
 	  Say Y or M here to enable support for the Samsung s6e3fc3
 	  1080x2400 command mode panel, as fitted to the Google Pixel 6.
