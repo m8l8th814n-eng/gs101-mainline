@@ -26,6 +26,7 @@
 
 #include <linux/clk.h>
 #include <linux/component.h>
+#include <linux/debugfs.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -127,6 +128,11 @@ struct gs101_dpp {
 	struct clk_bulk_data clks[ARRAY_SIZE(gs101_dpp_clk_names)];
 	struct drm_plane plane;
 	u32 id;
+	void *black;
+	dma_addr_t black_dma;
+	u32 black_size;
+	struct dentry *debugfs;
+	u32 format_override;
 };
 
 static inline struct gs101_dpp *plane_to_dpp(struct drm_plane *plane)
@@ -250,8 +256,12 @@ static void gs101_dpp_atomic_update(struct drm_plane *plane,
 	 */
 	val = readl(dpp->regs[DPP_REG_DMA] + RDMA_IN_CTRL_0);
 	val &= ~IDMA_IMG_FORMAT_MASK;
-	val |= IDMA_IMG_FORMAT(fb->format->has_alpha ? IMG_FORMAT_BGRA8888
-						     : IMG_FORMAT_BGRX8888);
+	if (dpp->format_override <= 0x3f)
+		val |= IDMA_IMG_FORMAT(dpp->format_override);
+	else
+		val |= IDMA_IMG_FORMAT(fb->format->has_alpha ?
+				       IMG_FORMAT_BGRA8888 :
+				       IMG_FORMAT_BGRX8888);
 	writel(val, dpp->regs[DPP_REG_DMA] + RDMA_IN_CTRL_0);
 
 	writel(rdma_size(src_w, fb->height),
@@ -273,6 +283,21 @@ static void gs101_dpp_atomic_update(struct drm_plane *plane,
 static void gs101_dpp_atomic_disable(struct drm_plane *plane,
 				     struct drm_atomic_commit *state)
 {
+	struct gs101_dpp *dpp = plane_to_dpp(plane);
+	u32 val;
+
+	if (!dpp->black)
+		return;
+
+	val = readl(dpp->regs[DPP_REG_DMA] + RDMA_IN_CTRL_0);
+	val &= ~IDMA_IMG_FORMAT_MASK;
+	val |= IDMA_IMG_FORMAT(IMG_FORMAT_BGRX8888);
+	writel(val, dpp->regs[DPP_REG_DMA] + RDMA_IN_CTRL_0);
+
+	writel(dpp->black_size, dpp->regs[DPP_REG_DMA] + RDMA_SRC_SIZE);
+	writel(dpp->black_size, dpp->regs[DPP_REG_DMA] + RDMA_IMG_SIZE);
+	writel(lower_32_bits(dpp->black_dma),
+	       dpp->regs[DPP_REG_DMA] + RDMA_BASEADDR_Y8);
 }
 
 static const struct drm_plane_helper_funcs gs101_dpp_plane_helper_funcs = {
@@ -342,6 +367,17 @@ static int gs101_dpp_bind(struct device *dev, struct device *master,
 	 */
 	drm_dev_set_dma_dev(drm, dpp->dev);
 
+	dpp->black_size = readl(dpp->regs[DPP_REG_DMA] + RDMA_IMG_SIZE);
+	dpp->black = dmam_alloc_coherent(dpp->dev,
+					 (size_t)(dpp->black_size & 0xffff) *
+					 (dpp->black_size >> 16) * 4,
+					 &dpp->black_dma, GFP_KERNEL);
+	if (!dpp->black || upper_32_bits(dpp->black_dma))
+		dev_warn(dpp->dev, "DPP%u: no scanout buffer for disable\n",
+			 dpp->id);
+	if (dpp->black && upper_32_bits(dpp->black_dma))
+		dpp->black = NULL;
+
 	ret = drm_universal_plane_init(drm, &dpp->plane, 0,
 				       &gs101_dpp_plane_funcs,
 				       gs101_dpp_formats,
@@ -404,6 +440,7 @@ static int gs101_dpp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	dpp->dev = dev;
+	dpp->format_override = U32_MAX;
 	platform_set_drvdata(pdev, dpp);
 
 	if (of_property_read_u32(dev->of_node, "dpp,id", &dpp->id))
@@ -456,11 +493,20 @@ static int gs101_dpp_probe(struct platform_device *pdev)
 	 */
 	pm_runtime_enable(dev);
 
+	dpp->debugfs = debugfs_create_dir(dev_name(dev), NULL);
+	debugfs_create_x32("format_override", 0600, dpp->debugfs,
+			   &dpp->format_override);
+	debugfs_create_x32("black_size", 0400, dpp->debugfs,
+			   &dpp->black_size);
+
 	return component_add(dev, &gs101_dpp_component_ops);
 }
 
 static void gs101_dpp_remove(struct platform_device *pdev)
 {
+	struct gs101_dpp *dpp = platform_get_drvdata(pdev);
+
+	debugfs_remove_recursive(dpp->debugfs);
 	component_del(&pdev->dev, &gs101_dpp_component_ops);
 	pm_runtime_disable(&pdev->dev);
 }
