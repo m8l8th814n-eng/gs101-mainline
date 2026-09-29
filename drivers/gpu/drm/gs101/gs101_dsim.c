@@ -144,10 +144,13 @@ static void gs101_dsim_dump_state(struct gs101_dsim *dsim)
 		 status1 & LINK_STATUS1_CMD_MODE_STATUS ? "command" : "video");
 }
 
+static const struct component_ops gs101_dsim_component_ops;
+
 static int gs101_dsim_host_attach(struct mipi_dsi_host *host,
 				  struct mipi_dsi_device *device)
 {
 	struct gs101_dsim *dsim = host_to_dsim(host);
+	int ret;
 
 	if (dsim->panel_dsi)
 		return -EBUSY;
@@ -158,7 +161,11 @@ static int gs101_dsim_host_attach(struct mipi_dsi_host *host,
 		 dsim->id, dev_name(&device->dev), device->lanes,
 		 device->mode_flags);
 
-	return 0;
+	ret = component_add(dsim->dev, &gs101_dsim_component_ops);
+	if (ret)
+		dsim->panel_dsi = NULL;
+
+	return ret;
 }
 
 static int gs101_dsim_host_detach(struct mipi_dsi_host *host,
@@ -166,8 +173,10 @@ static int gs101_dsim_host_detach(struct mipi_dsi_host *host,
 {
 	struct gs101_dsim *dsim = host_to_dsim(host);
 
-	if (dsim->panel_dsi == device)
+	if (dsim->panel_dsi == device) {
+		component_del(dsim->dev, &gs101_dsim_component_ops);
 		dsim->panel_dsi = NULL;
+	}
 
 	return 0;
 }
@@ -326,18 +335,13 @@ static int gs101_dsim_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret,
 				     "failed to register DSI host\n");
 
-	ret = component_add(dev, &gs101_dsim_component_ops);
-	if (ret)
-		mipi_dsi_host_unregister(&dsim->host);
-
-	return ret;
+	return 0;
 }
 
 static void gs101_dsim_remove(struct platform_device *pdev)
 {
 	struct gs101_dsim *dsim = platform_get_drvdata(pdev);
 
-	component_del(&pdev->dev, &gs101_dsim_component_ops);
 	mipi_dsi_host_unregister(&dsim->host);
 }
 
