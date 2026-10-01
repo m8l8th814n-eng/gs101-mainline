@@ -391,7 +391,19 @@
 				region,rmem = <0>;
 				region,offset = <0x00000000>;
 				region,size = <0x00400000>;
-				region,cached = <1>;
+				/*
+				 * Uncached here. The vendor maps IPC cached because it
+				 * turns on PCIe IO coherency for ch0 (use-cache-coherency,
+				 * exynos_pcie_rc_set_iocc), so the CP snoops the AP caches.
+				 * pcie0 here is non-coherent, and with cached = 1 (and
+				 * legacy_raw_rx_buffer_cached = 0) cp_shmem_get_region()
+				 * hands out phys_to_virt(): the legacy rings and their
+				 * head/tail sat in the CPU cache. The std_udl MAIN download
+				 * stalled after the first data frame because the CP never
+				 * saw the next head. 0 maps it write-combine instead.
+				 */
+				/* region,cached = <1>; */
+				region,cached = <0>;
 			};
 			msi {
 				region,name = "MSI";
