@@ -1898,12 +1898,45 @@ static int update_handover_block_info(struct link_device *ld, unsigned long arg)
 	return 0;
 }
 
+/*
+ * GS101DBG 2026-10-01: the std_udl MAIN download stalls after the first data
+ * frame -- no further cp2ap MSI, and cp2ap_msg reads 0x83 (SEND_FMT|SEND_RAW).
+ * Prints the legacy ring pointers to see whether CP consumed the frame (RAW_TX
+ * out moves) and whether a reply sits in the FMT ring, which bootdump_rx_func
+ * never reads. Remove once MAIN downloads.
+ */
+static void gs101dbg_print_rings(struct mem_link_device *mld, const char *where)
+{
+	struct legacy_ipc_device *raw = mld->legacy_link_dev.dev[IPC_MAP_NORM_RAW];
+	struct legacy_ipc_device *fmt = mld->legacy_link_dev.dev[IPC_MAP_FMT];
+
+	mif_info("GS101DBG %s: RAW_TX in:%u out:%u RAW_RX in:%u out:%u FMT_TX in:%u out:%u FMT_RX in:%u out:%u cp2ap_msg:0x%08X\n",
+		 where,
+		 get_txq_head(raw), get_txq_tail(raw),
+		 get_rxq_head(raw), get_rxq_tail(raw),
+		 get_txq_head(fmt), get_txq_tail(fmt),
+		 get_rxq_head(fmt), get_rxq_tail(fmt),
+		 get_ctrl_msg(&mld->cp2ap_msg));
+
+	/* GS101DBG 2026-10-01: what the CP reads next, and its last reply */
+	if (get_txq_tail(raw) + 32 <= get_txq_buff_size(raw))
+		mif_info("GS101DBG %s: RAW_TX @out %u: %*ph\n", where,
+			 get_txq_tail(raw), 32,
+			 get_txq_buff(raw) + get_txq_tail(raw));
+	if (get_rxq_head(raw) >= 16)
+		mif_info("GS101DBG %s: RAW_RX last 16 @%u: %*ph\n", where,
+			 get_rxq_head(raw) - 16, 16,
+			 get_rxq_buff(raw) + get_rxq_head(raw) - 16);
+}
+
 static int bootdump_rx_func(struct mem_link_device *mld)
 {
 	int ret = 0;
 	struct legacy_ipc_device *dev = mld->legacy_link_dev.dev[IPC_MAP_NORM_RAW];
 
 	u32 qlen = mld->msb_rxq.qlen;
+
+	gs101dbg_print_rings(mld, "bootdump_rx");	/* GS101DBG 2026-10-01 */
 
 	while (qlen-- > 0) {
 		struct mst_buff *msb;
@@ -2781,6 +2814,9 @@ static int shmem_ioctl(struct link_device *ld, struct io_device *iod,
 		char str[SHMEM_BOOTLOG_BUFF];
 		unsigned int size = base[0]        + (base[1] << 8)
 				 + (base[2] << 16) + (base[3] << 24);
+
+		/* GS101DBG 2026-10-01: ring pointers on demand (tinycbd bootlog) */
+		gs101dbg_print_rings(mld, "bootlog_ioctl");
 
 		if (size <= 0 || size > SHMEM_BOOTLOG_BUFF - SHMEM_BOOTLOG_OFFSET) {
 			mif_info("Invalid CP boot log[%d]\n", size);

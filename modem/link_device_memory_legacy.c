@@ -323,6 +323,20 @@ int xmit_to_legacy_link(struct mem_link_device *mld, u8 ch,
 
 	}
 
+	/*
+	 * GS101DBG 2026-10-01: std_udl MAIN stalls after the first data frame.
+	 * Shows per boot write whether CP consumed the previous one (out moves).
+	 * Remove once MAIN downloads.
+	 */
+	mif_info("GS101DBG %s_TX qsize:%u in:%u->%u out:%u len:%u\n",
+		 dev->name, qsize, in, get_txq_head(dev), get_txq_tail(dev), count);
+	/*
+	 * GS101DBG 2026-10-01: the frame head as it now sits in the ring
+	 * (read back through the uncached mapping, so what the CP will see).
+	 */
+	if (in + 32 <= qsize)
+		mif_info("GS101DBG %s_TX @%u: %*ph\n", dev->name, in, 32, dst + in);
+
 #ifdef DEBUG_MODEM_IF_LINK_TX
 	mif_pkt(ch, "LNK-TX", skb);
 #endif
