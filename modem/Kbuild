@@ -14,6 +14,9 @@ ccflags-y += -DCPIF_WAKEPKT_SET_MARK=0x80000000
 ccflags-y += -DCONFIG_OPTION_REGION=\"EUR\"
 ccflags-y += -I$(srctree)/vendor-stub-include
 ccflags-y += -I$(src)
+# mif_info/mif_info_limited are pr_debug (modem_v1.h); uncomment for the
+# full cpif log again.
+# ccflags-y += -DDEBUG
 
 # The CONFIG_* on the make command line reach Kbuild but not the
 # preprocessor -- only .config symbols become macros through autoconf.h.

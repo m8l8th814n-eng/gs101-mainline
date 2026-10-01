@@ -406,10 +406,18 @@ struct cpif_gpio {
 #define mif_err(fmt, ...) \
 	pr_err(LOG_TAG "%s: " pr_fmt(fmt), __func__, ##__VA_ARGS__)
 
+/*
+ * Info-level chatter (531 call sites) goes to pr_debug: compiled out unless
+ * this directory is built with -DDEBUG (see modem/Kbuild). mif_err stays.
+ */
+/* #define mif_info_limited(fmt, ...) \
+	printk_ratelimited(KERN_INFO LOG_TAG "%s: " pr_fmt(fmt), __func__, ##__VA_ARGS__) */
+/* #define mif_info(fmt, ...) \
+	pr_info(LOG_TAG "%s: " pr_fmt(fmt), __func__, ##__VA_ARGS__) */
 #define mif_info_limited(fmt, ...) \
-	printk_ratelimited(KERN_INFO LOG_TAG "%s: " pr_fmt(fmt), __func__, ##__VA_ARGS__)
+	pr_debug(LOG_TAG "%s: " pr_fmt(fmt), __func__, ##__VA_ARGS__)
 #define mif_info(fmt, ...) \
-	pr_info(LOG_TAG "%s: " pr_fmt(fmt), __func__, ##__VA_ARGS__)
+	pr_debug(LOG_TAG "%s: " pr_fmt(fmt), __func__, ##__VA_ARGS__)
 
 #define mif_debug(fmt, ...) \
 	pr_debug(LOG_TAG "%s: " pr_fmt(fmt), __func__, ##__VA_ARGS__)
