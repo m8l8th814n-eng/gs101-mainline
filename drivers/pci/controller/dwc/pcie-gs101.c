@@ -66,6 +66,8 @@ struct gs101_pcie {
 	struct gpio_desc	*perst;
 	u32			num_lanes;
 	int			ch_num;
+	/* set by exynos_pcie_poweroff(): poweron has to redo the PHY */
+	bool			link_was_up;
 };
 
 #define to_gs101_pcie(x)	dev_get_drvdata((x)->dev)
@@ -496,6 +498,37 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 		return -ENODEV;
 
 	if (!gs101_pcie_link_up(&pcie->pci)) {
+		/*
+		 * exynos_pcie_poweroff() leaves the endpoint in PERST#; release
+		 * it as host_init does before training. A no-op on the first
+		 * power-on, where host_init already released it.
+		 */
+		/* gpiod_set_value_cansleep(pcie->perst, 0); */
+		/* usleep_range(18000, 20000); */
+
+		/*
+		 * After a power-off the PHY has to be set up again before the
+		 * link retrains: re-enabling the LTSSM alone sat in
+		 * PRE_DETECT_QUIET. The vendor redoes PHY config and its lock
+		 * checks in exynos_pcie_rc_establish_link() on every power-on;
+		 * this repeats the PHY part of gs101_pcie_host_init(). ELBI and
+		 * DBI settings live in the controller and are kept, and
+		 * dw_pcie_setup_rc() is not rerun so the MSI target cpif just
+		 * set (exynos_pcie_set_msi_ctrl_addr) is not overwritten.
+		 */
+		if (pcie->link_was_up) {
+			gpiod_set_value_cansleep(pcie->perst, 1);
+			phy_exit(pcie->phy);
+			ret = phy_init(pcie->phy);
+			if (ret)
+				return ret;
+			regmap_update_bits(pcie->pmureg, pcie->pmu_offset,
+					   PCIE_PHY_CTRL_LINK,
+					   PCIE_PHY_CTRL_LINK);
+		}
+		gpiod_set_value_cansleep(pcie->perst, 0);
+		usleep_range(18000, 20000);
+
 		ret = dw_pcie_start_link(&pcie->pci);
 		if (ret)
 			return ret;
@@ -524,8 +557,37 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 }
 EXPORT_SYMBOL_GPL(exynos_pcie_poweron);
 
+/*
+ * Take the link down for real. cpif's s5100_poweroff_pcie() marks the link
+ * off (pcie_powered_on = false) once the CP drops CP2AP_WAKEUP, and later
+ * wakes the CP through s5100_try_gpio_cp_wakeup(), which only raises
+ * AP2CP_WAKEUP while s51xx_check_pcie_link_status() reports the link down.
+ * As a stub this left the link up behind cpif's back: every AP-to-CP doorbell
+ * after the first idle period was reserved forever ("PCI not powered on"),
+ * and a modem restart found a stale "link up" and skipped training, so
+ * s51xx_pcie_restore_state() then stalled the bus on a dead endpoint.
+ *
+ * The PHY and clocks stay on; the vendor's L2/PHY power-down is not done here.
+ * exynos_pcie_poweron() releases PERST# and retrains.
+ */
+/*
 int exynos_pcie_poweroff(int ch_num)
 {
+	return 0;
+}
+*/
+int exynos_pcie_poweroff(int ch_num)
+{
+	struct gs101_pcie *pcie = gs101_pcie_get_ch(ch_num);
+
+	if (!pcie)
+		return -ENODEV;
+
+	dw_pcie_stop_link(&pcie->pci);
+	gpiod_set_value_cansleep(pcie->perst, 1);
+	/* the next exynos_pcie_poweron() has to redo the PHY */
+	pcie->link_was_up = true;
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(exynos_pcie_poweroff);
