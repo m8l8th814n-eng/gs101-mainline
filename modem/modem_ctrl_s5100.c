@@ -1832,7 +1832,12 @@ int s5100_poweron_pcie(struct modem_ctl *mc, bool boot_on)
 		/* DBG: check MSI sfr setting values */
 		print_msi_register(mc->s51xx_pdev);
 	} else {
-		mif_err("DBG: MSI sfr not set up, yet(s5100_pdev is NULL)");
+		/*
+		 * Normal on the first power-on: s51xx is not probed yet, and
+		 * its probe sets up MSI right after. Not an error.
+		 */
+		/* mif_err("DBG: MSI sfr not set up, yet(s5100_pdev is NULL)"); */
+		mif_info("MSI set up at s51xx probe (first power-on)\n");
 	}
 
 	set_pcie_msi_int(ld, true);
