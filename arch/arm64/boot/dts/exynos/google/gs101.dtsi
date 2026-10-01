@@ -1811,6 +1811,17 @@
 			max-link-speed = <3>;
 			interrupts = <GIC_SPI 472 IRQ_TYPE_LEVEL_HIGH 0>;
 			interrupt-names = "msi";
+
+			/*
+			 * Legacy INTx routing, as on pcie1 below. The modem uses
+			 * MSI only, but without a map of_irq_parse_pci() logs
+			 * -EINVAL for the root port every time the CP is
+			 * enumerated. The vendor has no map here either.
+			 */
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 0>;
+			interrupt-map = <0 0 0 0 &gic GIC_SPI 472
+					 IRQ_TYPE_LEVEL_HIGH 0>;
 			clocks = <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN4A_DBI_ACLK>,
 				 <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN4A_MSTR_ACLK>,
 				 <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN4A_SLV_ACLK>,
