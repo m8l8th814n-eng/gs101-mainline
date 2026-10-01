@@ -42,6 +42,12 @@
 #define   IRQ_MSI_RISING_ASSERT		BIT(17)
 #define PCIE_IRQ2_EN			0x018
 #define   IRQ_MSI_CTRL_EN_RISING_EDG	BIT(17)
+/* vendor pcie-exynos-rc.h, used when relinking after a power-off */
+#define PCIE_DEVICE_TYPE		0x080
+#define   DEVICE_TYPE_RC		0x4
+#define PCIE_SOFT_RESET			0x3a4
+#define   SOFT_PWR_RESET		BIT(1)
+#define   SOFT_NON_STICKY_RESET		BIT(3)
 
 /* LTSSM states, see the PCIe base spec */
 #define S_RCVRY_LOCK			0x0d
@@ -159,12 +165,14 @@ static void gs101_pcie_stop_link(struct dw_pcie *pci)
 #define PCIE_RC_BAR0_MASK	0x100010
 #define PCIE_RC_ROM_BAR_MASK	0x100030
 
+static void gs101_pcie_setup_elbi(struct gs101_pcie *pcie);
+
 static int gs101_pcie_host_init(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 	struct gs101_pcie *pcie = to_gs101_pcie(pci);
 	struct device *dev = pci->dev;
-	u32 val;
+	/* u32 val; -- now used in gs101_pcie_setup_elbi() */
 	int ret;
 
 	ret = clk_bulk_prepare_enable(pcie->num_clks, pcie->clks);
@@ -191,6 +199,26 @@ static int gs101_pcie_host_init(struct dw_pcie_rp *pp)
 
 	gpiod_set_value_cansleep(pcie->perst, 0);
 	usleep_range(18000, 20000);
+
+	gs101_pcie_setup_elbi(pcie);
+
+	return 0;
+
+err_isolate:
+	gs101_pcie_phy_isolation(pcie, false);
+	clk_bulk_disable_unprepare(pcie->num_clks, pcie->clks);
+
+	return ret;
+}
+
+/*
+ * Controller-side setup after PERST# release, shared by host_init and the
+ * relink in exynos_pcie_poweron() (moved out of gs101_pcie_host_init()).
+ */
+static void gs101_pcie_setup_elbi(struct gs101_pcie *pcie)
+{
+	struct dw_pcie *pci = &pcie->pci;
+	u32 val;
 
 	val = gs101_elbi_read(pcie, PCIE_APP_REQ_EXIT_L1_MODE);
 	val |= APP_REQ_EXIT_L1_MODE | L1_REQ_NAK_CONTROL_MASTER;
@@ -232,14 +260,6 @@ static int gs101_pcie_host_init(struct dw_pcie_rp *pp)
 		dw_pcie_writel_dbi(pci, PCIE_RC_ROM_BAR_MASK, 0);
 		dw_pcie_dbi_ro_wr_dis(pci);
 	}
-
-	return 0;
-
-err_isolate:
-	gs101_pcie_phy_isolation(pcie, false);
-	clk_bulk_disable_unprepare(pcie->num_clks, pcie->clks);
-
-	return ret;
 }
 
 static irqreturn_t gs101_pcie_irq_handler(int irq, void *arg)
@@ -488,6 +508,7 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 	struct gs101_pcie *pcie = gs101_pcie_get_ch(ch_num);
 	struct dw_pcie_rp *pp;
 	struct pci_dev *rp;
+	u32 val;
 	int ret;
 
 	if (!pcie)
@@ -517,6 +538,7 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 		 * set (exynos_pcie_set_msi_ctrl_addr) is not overwritten.
 		 */
 		if (pcie->link_was_up) {
+			dev_info(pcie->pci.dev, "relink: PHY re-init after power-off\n");
 			gpiod_set_value_cansleep(pcie->perst, 1);
 			phy_exit(pcie->phy);
 			ret = phy_init(pcie->phy);
@@ -525,9 +547,47 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 			regmap_update_bits(pcie->pmureg, pcie->pmu_offset,
 					   PCIE_PHY_CTRL_LINK,
 					   PCIE_PHY_CTRL_LINK);
+
+			/*
+			 * PHY re-init alone still sat in PRE_DETECT_QUIET (#57).
+			 * The vendor follows PHY config with a soft power reset
+			 * of the controller, the RC device type and a
+			 * non-sticky reset (exynos_pcie_rc_establish_link()).
+			 */
+			val = gs101_elbi_read(pcie, PCIE_SOFT_RESET);
+			val &= ~SOFT_PWR_RESET;
+			gs101_elbi_write(pcie, val, PCIE_SOFT_RESET);
+			usleep_range(1000, 1100);
+			val |= SOFT_PWR_RESET;
+			gs101_elbi_write(pcie, val, PCIE_SOFT_RESET);
+
+			gs101_elbi_write(pcie, DEVICE_TYPE_RC, PCIE_DEVICE_TYPE);
+
+			val = gs101_elbi_read(pcie, PCIE_SOFT_RESET);
+			val |= SOFT_NON_STICKY_RESET;
+			gs101_elbi_write(pcie, val, PCIE_SOFT_RESET);
+			usleep_range(10, 12);
+			val &= ~SOFT_NON_STICKY_RESET;
+			gs101_elbi_write(pcie, val, PCIE_SOFT_RESET);
+			usleep_range(1000, 1100);
+			val |= SOFT_NON_STICKY_RESET;
+			gs101_elbi_write(pcie, val, PCIE_SOFT_RESET);
 		}
 		gpiod_set_value_cansleep(pcie->perst, 0);
 		usleep_range(18000, 20000);
+
+		if (pcie->link_was_up) {
+			/*
+			 * The non-sticky reset cleared the controller config:
+			 * redo host_init's ELBI/BAR setup and the RC setup.
+			 * dw_pcie_setup_rc() reprograms the MSI target from
+			 * pp->msi_data, which exynos_pcie_set_msi_ctrl_addr()
+			 * has already pointed at cpif's address.
+			 */
+			gs101_pcie_setup_elbi(pcie);
+			dw_pcie_setup_rc(pp);
+			pcie->link_was_up = false;
+		}
 
 		ret = dw_pcie_start_link(&pcie->pci);
 		if (ret)
