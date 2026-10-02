@@ -79,6 +79,14 @@ struct gs101_pcie {
 #define to_gs101_pcie(x)	dev_get_drvdata((x)->dev)
 
 /*
+ * exynos_pcie_poweron() link training: tries and wait per try. The vendor
+ * retries up to 10 times with ~24-48 ms each; a good relink here reaches L0
+ * well inside 150 ms, and 5 tries stay inside the CP's ~3 s wakeup budget.
+ */
+#define GS101_RELINK_TRIES	5
+#define GS101_RELINK_WAIT_MS	150
+
+/*
  * The Samsung CP interface driver addresses root complexes by channel number
  * rather than by device, so keep a small registry keyed on the PCI domain from
  * "linux,pci-domain". Channel 0 is HSI1 and carries the modem, channel 1 is
@@ -510,6 +518,8 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 	struct pci_dev *rp;
 	u32 val;
 	int ret;
+	int try_cnt = 0;
+	int i;
 
 	if (!pcie)
 		return -ENODEV;
@@ -537,8 +547,21 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 		 * dw_pcie_setup_rc() is not rerun so the MSI target cpif just
 		 * set (exynos_pcie_set_msi_ctrl_addr) is not overwritten.
 		 */
-		if (pcie->link_was_up) {
-			dev_info(pcie->pci.dev, "relink: PHY re-init after power-off\n");
+		/*
+		 * The full reset now runs on every power-on with the link down,
+		 * as the vendor's exynos_pcie_rc_establish_link() does, not only
+		 * after exynos_pcie_poweroff(): a failed try left link_was_up
+		 * clear and the next power-on skipped the PHY re-init. A try
+		 * that does not reach L0 is retried from PERST# like the
+		 * vendor's try_cnt loop, with a short wait per try -- a CP that
+		 * raised CP2AP_WAKEUP crashed ~3 s after one 900 ms
+		 * dw_pcie_wait_for_link() timed out with "Device not found".
+		 */
+retry:
+		/* if (pcie->link_was_up) { */
+		{
+			dev_info(pcie->pci.dev, "relink: PHY re-init after power-off (try %d)\n",
+				 try_cnt + 1);
 			gpiod_set_value_cansleep(pcie->perst, 1);
 			phy_exit(pcie->phy);
 			ret = phy_init(pcie->phy);
@@ -576,7 +599,8 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 		gpiod_set_value_cansleep(pcie->perst, 0);
 		usleep_range(18000, 20000);
 
-		if (pcie->link_was_up) {
+		/* if (pcie->link_was_up) { */
+		{
 			/*
 			 * The non-sticky reset cleared the controller config:
 			 * redo host_init's ELBI/BAR setup and the RC setup.
@@ -593,6 +617,35 @@ int exynos_pcie_poweron(int ch_num, int spd, int width)
 		if (ret)
 			return ret;
 
+		/* ret = dw_pcie_wait_for_link(&pcie->pci); */
+		/* if (ret) */
+		/*	return ret; */
+		for (i = 0; i < GS101_RELINK_WAIT_MS / 10; i++) {
+			if (gs101_pcie_link_up(&pcie->pci))
+				break;
+			usleep_range(10000, 11000);
+		}
+		if (!gs101_pcie_link_up(&pcie->pci)) {
+			enum dw_pcie_ltssm ltssm = dw_pcie_get_ltssm(&pcie->pci);
+
+			/*
+			 * Leave the link fully down (LTSSM off, PERST#) so it
+			 * cannot train on its own while cpif believes it is off,
+			 * and so the next try or power-on starts clean.
+			 */
+			dw_pcie_stop_link(&pcie->pci);
+			gpiod_set_value_cansleep(pcie->perst, 1);
+			pcie->link_was_up = true;
+			if (++try_cnt < GS101_RELINK_TRIES) {
+				dev_warn(pcie->pci.dev, "relink: no link (LTSSM 0x%x), retrying\n",
+					 ltssm);
+				goto retry;
+			}
+			dev_err(pcie->pci.dev, "relink: no link after %d tries\n",
+				try_cnt);
+			return -ENODEV;
+		}
+		/* reports speed/width; returns at once now that the link is up */
 		ret = dw_pcie_wait_for_link(&pcie->pci);
 		if (ret)
 			return ret;
